@@ -4,7 +4,8 @@ from typing import Dict
 
 from .config import AppConfig
 from .modules.base import BaseModule
-from .modules.combat.module import CombatModule
+from .modules.combat_analysis.module import CombatModule
+from .modules.combat_assistant.module import CombatAssistantModule
 from .modules.player_stats.module import PlayerStatsModule
 
 
@@ -17,6 +18,7 @@ class App(tk.Tk):
         self.geometry("1100x700")
         self._maximize_window()
         self.config = config
+        self.current_module = None
 
         self.colors = {
             "bg": "#0b1224",
@@ -32,7 +34,8 @@ class App(tk.Tk):
         self._init_theme()
 
         self.modules: Dict[str, BaseModule] = {
-            "Combat Analysis": CombatModule(self, self.config),
+            "Combat Analyzer": CombatModule(self, self.config),
+            "Combat Assistant": CombatAssistantModule(self, self.config),
             # "Player Stats": PlayerStatsModule(self, self.config),
         }
 
@@ -49,6 +52,10 @@ class App(tk.Tk):
         self._build_welcome()
 
     def _build_welcome(self) -> None:
+        if self.current_module:
+            self.current_module.on_hide()
+            self.current_module = None
+
         for widget in self.navbar.winfo_children():
             widget.destroy()
         for widget in self.content.winfo_children():
@@ -188,6 +195,10 @@ class App(tk.Tk):
         ttk.Button(container, text="Close", command=win.destroy, style="Accent.TButton").grid(row=2, column=1, sticky="e", pady=20)
 
     def show_module(self, module: BaseModule) -> None:
+        if self.current_module and self.current_module != module:
+            self.current_module.on_hide()
+        self.current_module = module
+
         for widget in self.navbar.winfo_children():
             widget.destroy()
         for widget in self.content.winfo_children():
@@ -323,6 +334,15 @@ class App(tk.Tk):
 
 
 def run_app() -> None:
+    try:
+        import ctypes
+        # Reverting to System Aware (1).
+        # Per-Monitor (2) causes the main window to be huge on low-DPI screens because Tkinter widgets don't auto-scale well.
+        # We will handle Overlay positioning manually using SetWindowPos.
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
     config = AppConfig.load()
     app = App(config)
     app.mainloop()

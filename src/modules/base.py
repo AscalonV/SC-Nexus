@@ -14,3 +14,7 @@ class BaseModule(ABC):
     @abstractmethod
     def on_show(self):
         """Called when the module is navigated to so it can refresh data."""
+
+    def on_hide(self):
+        """Called when navagating away from the module."""
+        pass

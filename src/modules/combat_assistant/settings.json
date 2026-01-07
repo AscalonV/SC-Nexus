@@ -1,0 +1,39 @@
+{
+  "regions": {
+    "ally_roster": [
+      2,
+      533,
+      324,
+      268
+    ],
+    "enemy_roster": [
+      1768,
+      536,
+      269,
+      269
+    ]
+  },
+  "points": {
+    "cmd": [
+      1124,
+      106
+    ],
+    "shield": [
+      1030,
+      116
+    ],
+    "weapon": [
+      1087,
+      110
+    ]
+  },
+  "agony": true,
+  "bomb": true,
+  "torp": true,
+  "capture": true,
+  "overlay": true,
+  "overlay_pos": [
+    45,
+    50
+  ]
+}
