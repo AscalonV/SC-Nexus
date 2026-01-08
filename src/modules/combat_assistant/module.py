@@ -4,12 +4,13 @@ import time
 import re
 import json
 import threading
+import queue
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 from ...config import AppConfig
 from ..base import BaseModule
-from ..combat_analysis.parser import AURA_APPLY_RE, AURA_CANCEL_RE, _strip_id
+from ..combat_analysis.parser import AURA_APPLY_RE, AURA_CANCEL_RE, GAME_END_RE, DAMAGE_HEAL_RE, _strip_id
 from .log_reader import LogTailer
 from .overlay import OverlayWindow, CalibrationOverlay
 from .scanner import ScreenScanner
@@ -69,6 +70,21 @@ class CombatAssistantModule(BaseModule):
         
         # Capture State (Timestamps of last sound play to throttle)
         self.last_capture_sound: Dict[str, float] = {}
+        self.capture_start_times: Dict[str, float] = {} # Track when white color started
+
+        # Visibility Logic
+        self.master_overlay_enabled = tk.BooleanVar(value=True) # User switch
+        self.match_active_signal = False # Match start/end
+        self.last_damage_time = 0.0 # Combat activity
+        self._is_visible = False # Actual state
+        
+        # Backward compatibility for existing settings
+        self.enable_overlay_var = self.master_overlay_enabled
+
+        # Sound Queue
+        self.sound_queue = queue.Queue()
+        self._sound_thread = threading.Thread(target=self._sound_worker, daemon=True)
+        self._sound_thread.start()
 
         # Overlay Position Defaults
         self.overlay_x = 100
@@ -90,11 +106,96 @@ class CombatAssistantModule(BaseModule):
         self.scanner.load_template("bomb_ally", self.assets_path / "Allied bomb logo.png")
         self.scanner.load_template("bomb_enemy", self.assets_path / "Enemy bomb logo.png")
 
+        # Theme Colors (Matched to Combat Analysis)
+        self.colors = {
+            "bg": "#0b1224",
+            "panel": "#111b33",
+            "surface": "#16213f",
+            "border": "#24365c",
+            "accent": "#3de7ff",
+            "accent_soft": "#7be8ff",
+            "accent_dark": "#1b4f73",
+            "text": "#e9f3ff",
+            "muted": "#9bb3d6",
+        }
+        self.checkbox_imgs = {}
+
         # UI Elements
         self.agony_label: Optional[tk.Label] = None
         self.torp_label: Optional[tk.Label] = None
         self.bomb_ally_label: Optional[tk.Label] = None
         self.bomb_enemy_label: Optional[tk.Label] = None
+        self.overlay_editing = False
+        self.overlay_btn_text: Optional[tk.StringVar] = None
+        
+        self.debug_labels = {}
+        self.region_labels = {}
+        
+        # Init Theme Resources
+        self._ensure_check_images()
+
+    def _ensure_check_images(self) -> None:
+        if self.checkbox_imgs:
+            return
+        panel = self.colors["panel"]
+        border = self.colors["border"]
+        fill = self.colors["surface"]
+
+        def make(on: bool) -> tk.PhotoImage:
+            img = tk.PhotoImage(width=16, height=16)
+            # Base fill skipped to allow transparency (shows button bg)
+            # Inner box
+            img.put(fill, to=(2, 2, 14, 14))
+            # Border
+            for x in range(0, 16):
+                img.put(border, to=(x, 0))
+                img.put(border, to=(x, 15))
+            for y in range(0, 16):
+                img.put(border, to=(0, y))
+                img.put(border, to=(15, y))
+            if on:
+                # Simple X mark - White
+                white = "#ffffff"
+                for i in range(4, 12):
+                    img.put(white, to=(i, i))
+                    img.put(white, to=(i, 15 - i))
+                    img.put(white, to=(i, i + 1))
+                    img.put(white, to=(i, 14 - i))
+            return img
+            
+        self.checkbox_imgs["off"] = make(False)
+        self.checkbox_imgs["on"] = make(True)
+
+    def _make_checkbox(self, parent, text: str, var: tk.Variable, command=None, bg_color=None) -> tk.Checkbutton:
+        # Matches CombatAnalysisModule style
+        if bg_color is None:
+            bg_color = self.colors["panel"]
+            
+        chk = tk.Checkbutton(
+            parent,
+            text=text,
+            variable=var,
+            command=command,
+            image=self.checkbox_imgs["off"],
+            selectimage=self.checkbox_imgs["on"],
+            compound="left",
+            onvalue=True,
+            offvalue=False,
+            indicatoron=False,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            padx=4,
+            pady=2,
+            anchor="w",
+            bg=bg_color,
+            fg=self.colors["text"],
+            activebackground=bg_color,
+            activeforeground=self.colors["text"],
+            selectcolor=bg_color,
+            font=("Segoe UI", 9)
+        )
+        return chk
 
     def build(self, parent):
         self.frame = ttk.Frame(parent, style="App.TFrame")
@@ -107,7 +208,9 @@ class CombatAssistantModule(BaseModule):
         ttk.Label(controls, textvariable=self.active_log_file_var, style="TLabel").pack(side=tk.LEFT, padx=(5, 20))
         
         ttk.Button(controls, text="Edit Overlay Pos", command=self._toggle_overlay_edit, style="TButton").pack(side=tk.RIGHT)
-        ttk.Button(controls, text="Toggle Overlay", command=self._toggle_overlay_vis, style="TButton").pack(side=tk.RIGHT, padx=5)
+        
+        self.overlay_btn_text = tk.StringVar(value=f"Overlay Master: {'ON' if self.master_overlay_enabled.get() else 'OFF'}")
+        ttk.Button(controls, textvariable=self.overlay_btn_text, command=self._toggle_overlay_vis, style="TButton").pack(side=tk.RIGHT, padx=5)
 
         # --- Grid ---
         grid = ttk.Frame(self.frame, style="App.TFrame")
@@ -128,8 +231,8 @@ class CombatAssistantModule(BaseModule):
         # Header for Group
         h_conq = ttk.Frame(col_conq, style="App.TFrame")
         h_conq.pack(fill=tk.X, pady=(0, 5))
-        ttk.Checkbutton(h_conq, text="Conquest", variable=self.conquest_enabled, style="TCheckbutton", 
-            command=lambda: self._toggle_group("conquest")).pack(side=tk.LEFT)
+        self._make_checkbox(h_conq, "Conquest", self.conquest_enabled, 
+            command=lambda: self._toggle_group("conquest"), bg_color=self.colors["bg"]).pack(side=tk.LEFT)
         
         # 1. Torpedoes (Inside Conquest)
         self._build_card(col_conq, 0, 0, "Torpedo Timer", self.enable_torp_var,
@@ -139,24 +242,38 @@ class CombatAssistantModule(BaseModule):
         b_card = self._build_card(col_conq, 0, 0, "Bomb Tracker", self.enable_bomb_var,
             "Visual tracking of bomb icons.\nRequires setup of team areas.",
             [("Set Ally Area", lambda: self._calibrate_region("ally_roster")),
-             ("Set Enemy Area", lambda: self._calibrate_region("enemy_roster"))], pack=True)
+             ("Set Enemy Area", lambda: self._calibrate_region("enemy_roster")),
+             ("Show Areas", self._preview_regions)], # Added show areas button
+             pack=True)
+             
+        # Add Region Labels (Append to b_card)
+        r_frame = ttk.Frame(b_card, style="App.TFrame")
+        r_frame.pack(fill=tk.X, pady=5)
+        for key in ["ally_roster", "enemy_roster"]:
+            lbl = ttk.Label(r_frame, text=f"{key.replace('_', ' ').capitalize()}: Not Set", style="LabelMuted.TLabel", font=("Consolas", 8))
+            lbl.pack(anchor="w")
+            self.region_labels[key] = lbl
 
         # 3. System Capture
         c_buttons = [("Set Command", lambda: self._calibrate_point("cmd")),
              ("Set Shield", lambda: self._calibrate_point("shield")),
-             ("Set Weapon", lambda: self._calibrate_point("weapon"))]
+             ("Set Weapon", lambda: self._calibrate_point("weapon")),
+             ("Show Points", self._preview_points)] # Added show points button
              
         c_card = self._build_card(col_conq, 0, 0, "System Capture", self.enable_capture_var,
             "Pixel monitoring of Dreadnought systems.", c_buttons, pack=True)
 
         # Add Debug Labels (Append to c_card)
-        self.debug_labels = {}
         curr_frame = ttk.Frame(c_card, style="App.TFrame")
         curr_frame.pack(fill=tk.X, pady=5)
         for key in ["cmd", "shield", "weapon"]:
             lbl = ttk.Label(curr_frame, text=f"{key.capitalize()}: -", style="LabelMuted.TLabel", font=("Consolas", 8))
             lbl.pack(anchor="w")
             self.debug_labels[key] = lbl
+            
+        # Initial UI Update
+        self._update_region_labels()
+        self._apply_debug_labels({})
 
 
         # --- Group 2: PvP ---
@@ -167,8 +284,8 @@ class CombatAssistantModule(BaseModule):
 
         h_pvp = ttk.Frame(col_pvp, style="App.TFrame")
         h_pvp.pack(fill=tk.X, pady=(0, 5))
-        ttk.Checkbutton(h_pvp, text="PvP", variable=self.pvp_enabled, style="TCheckbutton", 
-            command=lambda: self._toggle_group("pvp")).pack(side=tk.LEFT)
+        self._make_checkbox(h_pvp, "PvP", self.pvp_enabled,
+            command=lambda: self._toggle_group("pvp"), bg_color=self.colors["bg"]).pack(side=tk.LEFT)
 
         # 1. Agony
         self._build_card(col_pvp, 0, 0, "Agony Buff", self.enable_agony_var, 
@@ -177,7 +294,7 @@ class CombatAssistantModule(BaseModule):
 
         # Initialize Overlay
         if not self.overlay:
-            self.overlay = OverlayWindow(self.app, x=self.overlay_x, y=self.overlay_y)
+            self.overlay = OverlayWindow(self.app, x=self.overlay_x, y=self.overlay_y, on_move=self._on_overlay_move)
             self._build_overlay_content()
             self._update_overlay_visibility()
             # Try to force a geometry update or resize hint if on different DPI?
@@ -212,16 +329,21 @@ class CombatAssistantModule(BaseModule):
         else:
             card.grid(row=row, column=col, sticky="nw", padx=10, pady=10)
         
-        ttk.Checkbutton(card, text="Enable", variable=var, style="TCheckbutton", command=self._save_settings).pack(anchor="w")
+        # Use custom checkbox style via _make_checkbox
+        self._make_checkbox(card, "Enable", var, command=self._save_settings).pack(anchor="w")
         ttk.Label(card, text=desc, style="LabelMuted.TLabel", font=("Segoe UI", 9)).pack(anchor="w", pady=5)
         
         if buttons:
             btn_frame = ttk.Frame(card, style="App.TFrame")
             btn_frame.pack(fill=tk.X, pady=5)
-            for txt, cmd in buttons:
-                # Wrap cmd to avoid loop binding issues if any
+            # Refactored button layout slightly to handle 4 buttons gracefully
+            for i, (txt, cmd) in enumerate(buttons):
                 btn = ttk.Button(btn_frame, text=txt, command=cmd, style="TButton")
+                # Grid or Pack? Pack wraps badly. Grid is better if we know count.
+                # Let's simple pack with wrap in mind? Or just allow horizontal scroll?
+                # Actually, wrap frame if too many buttons.
                 btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+                
         return card
 
     def on_show(self):
@@ -254,12 +376,21 @@ class CombatAssistantModule(BaseModule):
             
         current_username = self.config.username.lower()
         now = time.time()
+        
+        # Check for damage activity to keep overlay alive
+        for line in lines:
+            if DAMAGE_HEAL_RE.search(line):
+                self.last_damage_time = now
+                self._update_visibility_logic()
 
         for line in lines:
             # Match Start / Game Session Start
             # Reset/Start timers
             # User update: check for "Start gameplay"
             if "Start gameplay" in line:
+                self.match_active_signal = True
+                self._update_visibility_logic()
+                
                 # User request: "Start timers for torpedos (norm interval) and both bombs (2 min)"
                 # Modified: "reduce initial timer by 7s (torp) and 2s (bomb)"
                 self.torp_launch_time = now
@@ -274,6 +405,11 @@ class CombatAssistantModule(BaseModule):
                 self.bomb_enemy_carried = False
                 self.bomb_ally_carried = False
                 
+            # Match End
+            if GAME_END_RE.search(line):
+                self.match_active_signal = False
+                self._update_visibility_logic()
+
             # Agony
             if self.enable_agony_var.get() and current_username:
                 m_apply = AURA_APPLY_RE.search(line)
@@ -353,24 +489,25 @@ class CombatAssistantModule(BaseModule):
     def _run_scan_thread(self):
         # Heavy lifting here
         with self.scan_lock:
-             # Capture Debug Update
-             # Note: Updates via Tkinter widgets must be done in main thread?
-             # Yes. WE compute values here and update variables or schedule callback.
-             # Actually, reading memory/screen is the slow part.
-             
-             # Capture Scan
-             if self.enable_capture_var.get() or self.enable_bomb_var.get():
-                 # We need to perform the scan
-                 pass
-
+             # Logic for features
              if self.enable_bomb_var.get():
                 self._scan_bombs()
             
              if self.enable_capture_var.get():
                  self._scan_capture()
-                 
-             # For debug labels, we can read pixels here, but update UI in main loop
-             self.app.after(0, self._update_capture_debug)
+             else:
+                 # Even if capture logic is disabled, if we have points set, we might want to update the debug labels 
+                 # (show just coordinates) or do a passive scan?
+                 # User asked for "detected color" to be displayed.
+                 # If disabled, maybe we should still read the pixel ONLY for the UI if points are set?
+                 # Let's check points.
+                 if self.points:
+                     # Minimal scan just for UI
+                     debug_vals = {}
+                     for name in ["cmd", "shield", "weapon"]:
+                         if name in self.points:
+                             debug_vals[name] = self.scanner.get_pixel_color(*self.points[name])
+                     self.app.after(0, self._apply_debug_labels, debug_vals)
 
     def _update_capture_debug(self):
         # This runs on main thread, quick check of LAST known values?
@@ -434,6 +571,7 @@ class CombatAssistantModule(BaseModule):
         # Assuming Team Blue is friendly defaults. Capture means turning from Blue to White (neutralizing) or Red.
         
         debug_vals = {}
+        now = time.time()
         
         for name, snd in [("cmd", SND_CAPT_CMD), ("shield", SND_CAPT_SHIELD), ("weapon", SND_CAPT_WEAPON)]:
             if name in self.points:
@@ -444,45 +582,108 @@ class CombatAssistantModule(BaseModule):
                 # Or check if significantly different from "Normal Blue"
                 # Simple heuristic: r > 200 and g > 200 and b > 200 (White)
                 if pixel[0] > 200 and pixel[1] > 200 and pixel[2] > 200:
-                    # Trigger sound logic
-                    self.app.after(0, self._trigger_capture_sound, name, snd)
+                    # White detected. Start timer if not running.
+                    if name not in self.capture_start_times:
+                        self.capture_start_times[name] = now
+                    
+                    # Check 2s Duration
+                    if (now - self.capture_start_times[name]) >= 2.0:
+                        # Trigger sound logic (cooldown handled inside _trigger_capture_sound)
+                        self.app.after(0, self._trigger_capture_sound, name, snd)
+                else:
+                    # Not white - reset timer
+                    if name in self.capture_start_times:
+                        del self.capture_start_times[name]
                     
         # Update Debug UI safely
         self.app.after(0, self._apply_debug_labels, debug_vals)
 
     def _apply_debug_labels(self, vals):
+        # Check global error state
+        if self.scanner.last_error:
+             lbl = self.debug_labels.get("cmd") # Hijack first label
+             if lbl:
+                 # ttk.Label does not support fg.
+                 lbl.config(text=f"Error: {self.scanner.last_error}")
+             return
+
         for key, lbl in self.debug_labels.items():
-            if key in vals:
-                lbl.config(text=f"{key.capitalize()}: RGB{vals[key]}")
+            if key in self.points:
+                 x, y = self.points[key]
+                 if key in vals:
+                     # Detected color available
+                     r, g, b = vals[key]
+                     lbl.config(text=f"{key.capitalize()}: ({x}, {y}) - RGB({r}, {g}, {b})")
+                 else:
+                     # Coordinates set, but not scanning/active
+                     lbl.config(text=f"{key.capitalize()}: ({x}, {y}) - Disabled/Not Scanning")
             else:
-                if key not in self.points:
-                    lbl.config(text=f"{key.capitalize()}: Not Set")
+                lbl.config(text=f"{key.capitalize()}: Not Set")
+
+    def _update_region_labels(self):
+        for key, lbl in self.region_labels.items():
+            if key in self.regions:
+                r = self.regions[key]
+                # rect: left, top, width, height
+                lbl.config(text=f"{key.replace('_', ' ').capitalize()}: ({r[0]}, {r[1]}) {r[2]}x{r[3]}")
+            else:
+                lbl.config(text=f"{key.replace('_', ' ').capitalize()}: Not Set")
 
     def _trigger_capture_sound(self, name, filename):
         now = time.time()
+        # Per-system cooldown check
         last = self.last_capture_sound.get(name, 0)
         if now - last > 20.0: # 20s cooldown
             self._play_sound(filename)
             self.last_capture_sound[name] = now
 
+    def _sound_worker(self):
+        while True:
+            path_str = self.sound_queue.get()
+            try:
+                import winsound
+                # SND_SYNC blocks, ensuring sequential playback
+                winsound.PlaySound(path_str, winsound.SND_SYNC | winsound.SND_FILENAME)
+            except Exception:
+                pass
+            finally:
+                self.sound_queue.task_done()
+
     def _play_sound(self, filename: str):
         path = Path(__file__).parent / "sounds" / filename
         if path.exists():
-            try:
-                import winsound
-                # SND_ASYNC | SND_FILENAME
-                winsound.PlaySound(str(path), winsound.SND_ASYNC | winsound.SND_FILENAME)
-            except ImportError:
-                pass
+            self.sound_queue.put(str(path))
 
     # --- Overlay & UI ---
     def _schedule_update(self):
         if not self.frame: return
+        
+        self._update_visibility_logic()
         self._update_overlay_ui()
         self.app.after(100, self._schedule_update)
 
+    def _update_visibility_logic(self):
+        # Master Switch Check
+        if not self.master_overlay_enabled.get():
+             if self._is_visible:
+                 self.overlay.hide() if self.overlay else None
+                 self._is_visible = False
+             return
+
+        # Logic Check
+        # Show if matched started OR recent damage (< 60s)
+        now = time.time()
+        should_show = self.match_active_signal or (now - self.last_damage_time < 60.0)
+        
+        if should_show and not self._is_visible:
+             if self.overlay: self.overlay.show()
+             self._is_visible = True
+        elif not should_show and self._is_visible:
+             if self.overlay: self.overlay.hide()
+             self._is_visible = False
+
     def _update_overlay_ui(self):
-        if not self.overlay or not self.enable_overlay_var.get():
+        if not self.overlay or not self._is_visible:
             return
             
         now = time.time()
@@ -553,15 +754,23 @@ class CombatAssistantModule(BaseModule):
         self.bomb_enemy_label = tk.Label(self.overlay.container, text="Enemy Bomb: READY", font=font_px, bg="black", fg="white")
 
     def _toggle_overlay_vis(self):
-        self.enable_overlay_var.set(not self.enable_overlay_var.get())
-        self._update_overlay_visibility()
+        # Just toggle the master switch. Logic handles the rest.
+        new_val = not self.master_overlay_enabled.get()
+        self.master_overlay_enabled.set(new_val)
+        if self.overlay_btn_text:
+             self.overlay_btn_text.set(f"Overlay Master: {'ON' if new_val else 'OFF'}")
+        self._update_visibility_logic() # Apply immediately
+        self._save_settings()
 
     def _update_overlay_visibility(self):
-        if self.overlay:
-            if self.enable_overlay_var.get():
-                self.overlay.show()
-            else:
-                self.overlay.hide()
+        # Deprecated: Logic now inside _update_visibility_logic
+        self._update_visibility_logic()
+
+    def _on_overlay_move(self, x: int, y: int):
+        if not self.overlay_editing:
+            return
+        self.overlay_x = x
+        self.overlay_y = y
         self._save_settings()
 
     def _toggle_overlay_edit(self):
@@ -569,6 +778,12 @@ class CombatAssistantModule(BaseModule):
             mode = not getattr(self.overlay, "_is_editing", False)
             self.overlay.toggle_edit_mode(mode)
             self.overlay._is_editing = mode
+            self.overlay_editing = mode
+            if not mode:
+                # Persist final position when leaving edit mode
+                pos = self.overlay.get_physical_position()
+                self.overlay_x, self.overlay_y = pos
+                self._save_settings()
             if mode: self.overlay.show() 
 
     # --- Calibration ---
@@ -576,17 +791,79 @@ class CombatAssistantModule(BaseModule):
         def cb(rect):
             self.regions[name] = rect
             self._save_settings()
+            self._update_region_labels()
             messagebox.showinfo("Calibration", f"Region '{name}' set.")
         
-        CalibrationOverlay(self.app, cb)
+        CalibrationOverlay(self.app, cb, selection_type="region")
 
     def _calibrate_point(self, name: str):
         def cb(rect):
             self.points[name] = (rect[0], rect[1])
             self._save_settings()
+            # Refresh debug labels immediately
+            self.app.after(0, self._apply_debug_labels, {})
             messagebox.showinfo("Calibration", f"Point '{name}' set.")
         
-        CalibrationOverlay(self.app, cb)
+        CalibrationOverlay(self.app, cb, selection_type="point")
+
+    def _preview_regions(self):
+        """Show colored boxes for set regions temporarily"""
+        self._show_preview_overlay(regions=self.regions)
+
+    def _preview_points(self):
+        """Show colored dots for set points temporarily"""
+        self._show_preview_overlay(points=self.points)
+
+    def _show_preview_overlay(self, regions=None, points=None):
+        if not regions and not points:
+             return
+             
+        # Create non-interactive transparent overlay
+        win = tk.Toplevel(self.app)
+        win.attributes("-alpha", 0.5)
+        win.attributes("-topmost", True)
+        win.attributes("-fullscreen", True)
+        win.attributes("-transparentcolor", "black") # Windows only
+        win.configure(bg="black")
+        
+        canvas = tk.Canvas(win, bg="black", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        if regions:
+            for name, r in regions.items():
+                # r = (x, y, w, h)
+                # Tkinter canvas coords need conversion if stored as physical?
+                # Actually, our CalibrationOverlay returns physical coords.
+                # If we draw on fullscreen window, we need logic coords OR handle DPI.
+                # Since we turned OFF scaling for app probably, or handling it manually.
+                # Let's try drawing text + rect.
+                
+                # We need to map Physical -> Logical if Tkinter is scaled.
+                # But earlier we found Tkinter coordinates in 'self.regions' are from 'GetCursorPos' (Physical).
+                # To draw on Tkinter Canvas which *is* scaled, we might have issues.
+                # BUT, if we create a canvas on a fullscreen window, Tkinter maps it to what it thinks is the screen.
+                # It is safer to use the 'CalibrationOverlay' approach using ctypes logic or valid geometry.
+                
+                # Simplified: Just draw. If inaccurate, user will see offset (which serves as a calibration check too!)
+                
+                # Color code
+                color = "#33ff33" if "ally" in name else "#ff3333"
+                
+                canvas.create_rectangle(r[0], r[1], r[0]+r[2], r[1]+r[3], outline=color, width=3)
+                canvas.create_text(r[0], r[1]-10, text=name, fill=color, anchor="sw", font=("Consolas", 14, "bold"))
+
+        if points:
+            for name, (x, y) in points.items():
+                color = "#3de7ff"
+                r = 5
+                canvas.create_oval(x-r, y-r, x+r, y+r, fill=color, outline=color)
+                canvas.create_text(x+10, y, text=name, fill=color, anchor="w", font=("Consolas", 12, "bold"))
+
+        # Auto-close
+        win.after(10000, win.destroy)
+        
+        # Click to close
+        canvas.bind("<Button-1>", lambda e: win.destroy())
 
     # --- Settings ---
     def _load_settings(self):
@@ -608,8 +885,8 @@ class CombatAssistantModule(BaseModule):
                 pass
 
     def _save_settings(self):
-        # Update current pos if overlay exists
-        if self.overlay:
+        # Update current pos if overlay exists and user is editing
+        if self.overlay and self.overlay_editing:
             pos_x, pos_y = self.overlay.get_physical_position()
             self.overlay_x = pos_x
             self.overlay_y = pos_y

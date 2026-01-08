@@ -5,7 +5,7 @@ from ctypes import wintypes
 import sys
 
 class OverlayWindow(tk.Toplevel):
-    def __init__(self, parent, x=100, y=100):
+    def __init__(self, parent, x=100, y=100, on_move=None):
         super().__init__(parent)
         # Defer overrideredirect to allow proper window manager placement
         self.withdraw()
@@ -28,14 +28,17 @@ class OverlayWindow(tk.Toplevel):
         # Safe Geometry Set
         # If x is negative, ensure format "+-100" (which means X=-100) not "-100" (which means R=100)
         # Tkinter geometry: "WxH+X+Y". If X < 0, "+-X".
-        sanitized_x = f"+{x}" if x >= 0 else f"{x}"
-        sanitized_y = f"+{y}" if y >= 0 else f"{y}"
+        sanitized_x = f"+{x}"
+        sanitized_y = f"+{y}"
         # If negative, we still need the delimiter '+' unless the number itself has '-', but parsing `+ -100`?
         # Standard: "+-100+200".
         
-        self.geometry(f"+{x}+{y}")
+        self.geometry(f"{sanitized_x}{sanitized_y}")
         self._target_x = x
         self._target_y = y
+        self._on_move = on_move
+        self._last_notified_pos = None
+        self._is_editing = False
         
         self._dragging = False
         self._offset_x = 0
@@ -74,7 +77,11 @@ class OverlayWindow(tk.Toplevel):
         """Place window at specific physical coordinates using Windows API."""
         try:
             if sys.platform == "win32":
-                ctx_prev = self._set_thread_dpi(self._DPI_UNAWARE_GDI)
+                x = int(x)
+                y = int(y)
+                # Use DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4) to ensure coordinates 
+                # are treated as physical screen coordinates without virtualization/scaling.
+                ctx_prev = self._set_thread_dpi(self._DPI_PER_MON_V2)
                 hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
                 # SWP_NOSIZE (0x0001) | SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010)
                 ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
@@ -162,6 +169,8 @@ class OverlayWindow(tk.Toplevel):
         if sys.platform != "win32":
             return
         self._lock_physical_size()
+        if self._is_editing:
+            self._notify_move()
 
     def set_clickthrough(self, enable: bool):
         if sys.platform != "win32":
@@ -206,7 +215,8 @@ class OverlayWindow(tk.Toplevel):
                 self.geometry(f"+{new_x}+{new_y}")
 
     def _start_drag(self, event):
-        if self._clickthrough: return
+        if self._clickthrough or not self._is_editing:
+            return
         self._dragging = True
         self._start_x_root = event.x_root
         self._start_y_root = event.y_root
@@ -244,8 +254,28 @@ class OverlayWindow(tk.Toplevel):
 
     def _stop_drag(self, event):
         self._dragging = False
+        self._notify_move()
+
+    def _notify_move(self):
+        if not self._on_move:
+            return
+        if getattr(self, "_dragging", False):
+            return
+        if not self.winfo_ismapped():
+            return
+        if not self._is_editing:
+            return
+        pos = self.get_physical_position()
+        if pos == self._last_notified_pos:
+            return
+        self._last_notified_pos = pos
+        try:
+            self._on_move(*pos)
+        except Exception:
+            pass
 
     def toggle_edit_mode(self, editing: bool):
+        self._is_editing = editing
         self.set_clickthrough(not editing)
         if editing:
             self.configure(bg="#222222") # Visible background
@@ -271,17 +301,34 @@ class OverlayWindow(tk.Toplevel):
 
 class CalibrationOverlay(tk.Toplevel):
     "Fullscreen slightly opaque window to select regions."
-    def __init__(self, parent, callback):
+    def __init__(self, parent, callback, selection_type="region"):
         super().__init__(parent)
         self.callback = callback
-        self.attributes("-fullscreen", True)
+        self.selection_type = selection_type # "region" or "point"
+
+        # Determine Virtual Screen Geometry (Logical, for Tkinter placement)
+        v_x = ctypes.windll.user32.GetSystemMetrics(76) # SM_XVIRTUALSCREEN
+        v_y = ctypes.windll.user32.GetSystemMetrics(77) # SM_YVIRTUALSCREEN
+        v_w = ctypes.windll.user32.GetSystemMetrics(78) # SM_CXVIRTUALSCREEN
+        v_h = ctypes.windll.user32.GetSystemMetrics(79) # SM_CYVIRTUALSCREEN
+        
+        self.geometry(f"{v_w}x{v_h}+{v_x}+{v_y}")
+        self.overrideredirect(True)
+        
         self.attributes("-alpha", 0.3)
         self.attributes("-topmost", True)
         self.configure(bg="black", cursor="crosshair")
         
+        # Logical Start (for drawing)
         self.start_x = 0
         self.start_y = 0
+        
+        # Physical Start (for result)
+        self.p_start_x = 0
+        self.p_start_y = 0
+        
         self.rect_id = None
+        self.processed = False
         
         self.canvas = tk.Canvas(self, bg="black", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -291,32 +338,76 @@ class CalibrationOverlay(tk.Toplevel):
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<Escape>", lambda e: self.destroy())
 
+    def _get_physical_cursor_pos(self):
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        return pt.x, pt.y
+
     def _on_press(self, event):
         self.start_x = event.x
         self.start_y = event.y
+        self.p_start_x, self.p_start_y = self._get_physical_cursor_pos()
+        
         if self.rect_id:
             self.canvas.delete(self.rect_id)
-        self.rect_id = self.canvas.create_rectangle(
-            self.start_x, self.start_y, self.start_x, self.start_y,
-            outline="red", width=2
-        )
+            
+        if self.selection_type == "point":
+             # Visual feedback: Crosshair/Circle
+             r = 5
+             self.rect_id = self.canvas.create_oval(
+                 self.start_x - r, self.start_y - r, self.start_x + r, self.start_y + r,
+                 outline="cyan", width=2
+             )
+        else:
+            self.rect_id = self.canvas.create_rectangle(
+                self.start_x, self.start_y, self.start_x, self.start_y,
+                outline="red", width=2
+            )
 
     def _on_drag(self, event):
         if self.rect_id:
-            self.canvas.coords(self.rect_id, self.start_x, self.start_y, event.x, event.y)
+            if self.selection_type == "point":
+                 r = 5
+                 self.canvas.coords(self.rect_id, event.x - r, event.y - r, event.x + r, event.y + r)
+            else:
+                 self.canvas.coords(self.rect_id, self.start_x, self.start_y, event.x, event.y)
 
     def _on_release(self, event):
-        x1, y1 = self.start_x, self.start_y
-        x2, y2 = event.x, event.y
+        if self.processed:
+            return
+        self.processed = True
+        
+        # Physical End
+        p_end_x, p_end_y = self._get_physical_cursor_pos()
+        
+        x1, y1 = self.p_start_x, self.p_start_y
+        x2, y2 = p_end_x, p_end_y
+        
         # Normalize
         left, top = min(x1, x2), min(y1, y2)
         width, height = abs(x2 - x1), abs(y2 - y1)
         
-        # If just a click (or tiny drag), treat as point
-        if width < 5 and height < 5:
-            self.callback((left, top, 0, 0)) # Point
+        # Determine Data
+        data = None
+        if self.selection_type == "point":
+            # Always treat release as point
+            # Use release coords if dragged, or start if clicked? 
+            # Cursor pos at release is best for "Point"
+            data = (p_end_x, p_end_y, 0, 0)
         else:
-            self.callback((left, top, width, height)) # Region
-            
+            # Region (allow fallback to point if tiny?)
+            if width < 5 and height < 5:
+                # If they clicked in region mode, maybe they meant point?
+                # But safer to just return a tiny region or 0-size?
+                # Current usage expects rect. 
+                data = (left, top, max(1, width), max(1, height))
+            else:
+                data = (left, top, width, height)
+
+        # Destroy FIRST to ensure window closes before any blocking callback actions
         self.destroy()
+        
+        # Schedule callback on parent to allow event loop to process destroy
+        if self.master:
+             self.master.after(5, lambda: self.callback(data))
 

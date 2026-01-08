@@ -14,13 +14,28 @@ from PIL import Image
 
 class ScreenScanner:
     def __init__(self):
-        self.sct = None
-        if HAS_MSS:
-            self.sct = mss.mss()
+        self._local = threading.local()
+        self.last_error = None
+        if not HAS_MSS:
+             self.last_error = "MSS Missing"
+        
         self.lock = threading.Lock()
         
         # Cache templates: Name -> PIL.Image
         self.templates = {}
+
+    @property
+    def sct(self):
+        if not HAS_MSS:
+            return None
+            
+        if not hasattr(self._local, "instance"):
+            try:
+                self._local.instance = mss.mss()
+            except Exception as e:
+                self.last_error = f"MSS Init Error: {e}"
+                return None
+        return self._local.instance
 
     def load_template(self, name: str, path: Path):
         if not path.exists():
@@ -45,13 +60,19 @@ class ScreenScanner:
         template_img = self.templates[template_name]
         tw, th = template_img.size
         
+        # Check region size vs template size
+        if region[2] < tw or region[3] < th:
+             self.last_error = f"Region too small ({region[2]}x{region[3]}) for {template_name} ({tw}x{th})"
+             return False
+
         # Monitor for mss
+        # Use absolute coordinates (virtual screen) by omitting "mon" or setting it to -1 (if needed, but dict implies absolute)
+        # Actually, mss grab(rect) uses absolute coords if rect is dict
         monitor = {
             "top": int(region[1]),
             "left": int(region[0]),
             "width": int(region[2]),
             "height": int(region[3]),
-            "mon": 1 
         }
 
         with self.lock:
@@ -130,20 +151,20 @@ class ScreenScanner:
                             
                 return False
             except Exception as e:
+                self.last_error = f"Template Error: {e}"
                 # print(e)
                 return False
 
     def get_pixel_color(self, x: int, y: int) -> Tuple[int, int, int]:
         """Returns (R, G, B)"""
-        if not HAS_MSS:
+        if not HAS_MSS or not self.sct:
             return (0, 0, 0)
             
         monitor = {
-            "top": y,
-            "left": x,
+            "top": int(y),
+            "left": int(x),
             "width": 1,
             "height": 1,
-            "mon": 1
         }
         with self.lock:
             try:
@@ -152,5 +173,6 @@ class ScreenScanner:
                 # pixel is at [0][0]
                 # data is accessible via sct_img.pixel(0, 0) -> (r, g, b)
                 return sct_img.pixel(0, 0)
-            except Exception:
+            except Exception as e:
+                self.last_error = f"Pixel Error: {e}"
                 return (0, 0, 0)
