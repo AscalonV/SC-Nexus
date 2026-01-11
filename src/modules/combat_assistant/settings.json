@@ -1,16 +1,16 @@
 {
   "regions": {
     "ally_roster": [
-      9,
-      670,
-      59,
-      332
+      8,
+      672,
+      88,
+      361
     ],
     "enemy_roster": [
-      2210,
-      666,
-      64,
-      352
+      2216,
+      664,
+      98,
+      359
     ]
   },
   "points": {
@@ -28,6 +28,9 @@
     ]
   },
   "agony": true,
+  "agony_users": [
+    "MasterN0VA"
+  ],
   "bomb": true,
   "torp": true,
   "capture": true,

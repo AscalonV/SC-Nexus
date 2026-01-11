@@ -1,10 +1,12 @@
 import tkinter as tk
+import os
 from tkinter import ttk, messagebox
 import time
 import re
 import json
 import threading
 import queue
+import ctypes
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
@@ -48,6 +50,12 @@ class CombatAssistantModule(BaseModule):
         self.agony_active_until = 0.0
         self.agony_cooldown_until = 0.0
         self.agony_is_active = False
+        
+        # Agony Multi-User Support
+        self.agony_users_vars: List[tk.StringVar] = []
+        self.agony_ui_frame: Optional[ttk.Frame] = None
+        # State: username -> {"active_until": float, "cooldown_until": float}
+        self.agony_states: Dict[str, Dict[str, float]] = {}
 
         # Torpedo State
         self.torp_launch_time = 0.0
@@ -105,6 +113,12 @@ class CombatAssistantModule(BaseModule):
         self.assets_path = Path(__file__).parent / "assets"
         self.scanner.load_template("bomb_ally", self.assets_path / "Allied bomb logo.png")
         self.scanner.load_template("bomb_enemy", self.assets_path / "Enemy bomb logo.png")
+
+        # Focus State Tracking
+        self._last_focus_state = None  # None, "game", or "other"
+
+        # Match State
+        self.match_is_conquest = False
 
         # Theme Colors (Matched to Combat Analysis)
         self.colors = {
@@ -288,9 +302,10 @@ class CombatAssistantModule(BaseModule):
             command=lambda: self._toggle_group("pvp"), bg_color=self.colors["bg"]).pack(side=tk.LEFT)
 
         # 1. Agony
-        self._build_card(col_pvp, 0, 0, "Agony Buff", self.enable_agony_var, 
+        agony_card = self._build_card(col_pvp, 0, 0, "Agony Buff", self.enable_agony_var, 
             "Tracks 'BuffNearDeath_big'.\nActive: 12s | CD: 25s",
             None, pack=True)
+        self._render_agony_ui(agony_card)
 
         # Initialize Overlay
         if not self.overlay:
@@ -308,9 +323,77 @@ class CombatAssistantModule(BaseModule):
             
         self._schedule_update()
         self._schedule_scan()
+        
+        # New Logic: Check current log file backwards for active match state
+        # Delay slightly to ensure tailer has found file
+        self.app.after(1000, self._check_match_state_from_log)
 
         return self.frame
     
+    def _check_match_state_from_log(self):
+        """
+        Reads the current log file backwards to determine if we are in a match.
+        Locates the last 'Start gameplay' or 'GAME END' event.
+        """
+        if not self.tailer or not self.tailer.current_file or not self.tailer.current_file.exists():
+            # Retry if file not ready yet
+            self.app.after(2000, self._check_match_state_from_log)
+            return
+
+        try:
+            path = self.tailer.current_file
+            found_start = False
+            found_end = False
+            is_conquest = False
+            start_time = 0.0
+
+            # Read file efficiently in chunks from end
+            chunk_size = 8192
+            file_size = os.path.getsize(path)
+            
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                # Read a larger chunk to ensure we catch 'Start gameplay' even in long matches.
+                # 5MB should cover hours of gameplay typically.
+                seek_pos = max(0, file_size - 5 * 1024 * 1024) 
+                f.seek(seek_pos)
+                lines = f.readlines()
+                
+                # Iterate backwards
+                for line in reversed(lines):
+                    # Check for End
+                    if not found_end and not found_start:
+                        if "Session finished" in line or "Quit application" in line: # GAME_END_RE equivalent
+                             found_end = True
+                             break # Match finished, we are idle
+                    
+                    # Check for Start
+                    if not found_start:
+                        if "Start gameplay" in line:
+                            found_start = True
+                            if "'ClanShip'" in line:
+                                is_conquest = True
+                            
+                            # We found start WITHOUT finding an End after it (since we search backwards).
+                            # So game is active.
+                            break
+                            
+            if found_start and not found_end:
+                 print("[DEBUG] Active match found in history!")
+                 self.match_active_signal = True
+                 self.match_is_conquest = is_conquest
+                 
+                 # Force visibility initially when we detect an active match
+                 # This ensures the overlay appears immediately upon attaching to a running game
+                 self.last_damage_time = time.time()
+                 
+                 self._update_visibility_logic()
+                 
+                 # Note: We cannot easily recover exact timers (bomb spawn times) without parsing timestamps 
+                 # which complicates things. 
+                 # But at least the overlay will show up.
+        except Exception as e:
+            print(f"Error checking log history: {e}")
+
     def _toggle_group(self, group):
         state = self.conquest_enabled.get() if group == "conquest" else self.pvp_enabled.get()
         if group == "conquest":
@@ -345,6 +428,51 @@ class CombatAssistantModule(BaseModule):
                 btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
                 
         return card
+
+    def _render_agony_ui(self, parent):
+        # Frame for dynamic list
+        f = ttk.Frame(parent, style="App.TFrame")
+        f.pack(fill=tk.X, pady=5)
+        self.agony_ui_frame = f
+        
+        # Render existing
+        self._refresh_agony_ui()
+        
+        # Buttons (+/-)
+        btn_frame = ttk.Frame(parent, style="App.TFrame")
+        btn_frame.pack(fill=tk.X, pady=2)
+        
+        # Use a lambda that traces the save to ensure we save when adding/removing
+        ttk.Button(btn_frame, text="+", command=self._add_agony_tracker, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="-", command=self._remove_agony_tracker, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(btn_frame, text="Add Usernames", style="LabelMuted.TLabel").pack(side=tk.LEFT, padx=5)
+
+    def _refresh_agony_ui(self):
+        if not self.agony_ui_frame: return
+        for w in self.agony_ui_frame.winfo_children(): w.destroy()
+        
+        for i, var in enumerate(self.agony_users_vars):
+            row = ttk.Frame(self.agony_ui_frame, style="App.TFrame")
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=f"User {i+2}:", style="LabelMuted.TLabel", width=8).pack(side=tk.LEFT)
+            e = ttk.Entry(row, textvariable=var)
+            e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            # Bind focus out to save? Or rely on explicit save elsewhere?
+            # Since vars are bound, _save_settings reads them. 
+            # But we need to trigger save when they type?
+            # Usually we use a trace or binding.
+            var.trace_add("write", lambda *args: self._save_settings())
+
+    def _add_agony_tracker(self):
+        self.agony_users_vars.append(tk.StringVar(value=""))
+        self._refresh_agony_ui()
+        self._save_settings()
+
+    def _remove_agony_tracker(self):
+        if self.agony_users_vars:
+            self.agony_users_vars.pop()
+            self._refresh_agony_ui()
+            self._save_settings()
 
     def on_show(self):
         if self.tailer:
@@ -389,6 +517,14 @@ class CombatAssistantModule(BaseModule):
             # User update: check for "Start gameplay"
             if "Start gameplay" in line:
                 self.match_active_signal = True
+                
+                # Check for Conquest Mode (ClanShip)
+                if "'ClanShip'" in line:
+                    self.match_is_conquest = True
+                    print("[DEBUG] Conquest Mode Detected (ClanShip)")
+                else:
+                    self.match_is_conquest = False
+                
                 self._update_visibility_logic()
                 
                 # User request: "Start timers for torpedos (norm interval) and both bombs (2 min)"
@@ -408,20 +544,42 @@ class CombatAssistantModule(BaseModule):
             # Match End
             if GAME_END_RE.search(line):
                 self.match_active_signal = False
+                self.match_is_conquest = False # Reset
+                self.agony_active_until = 0.0
+                self.agony_cooldown_until = 0.0
                 self._update_visibility_logic()
 
             # Agony
-            if self.enable_agony_var.get() and current_username:
-                m_apply = AURA_APPLY_RE.search(line)
+            if self.enable_agony_var.get():
+                m_apply = AURA_APPLY_RE.search(line) 
+                
                 if m_apply and m_apply.group("aura") == "BuffNearDeath_big":
-                    if _strip_id(m_apply.group("target")).lower() == current_username:
+                    target = _strip_id(m_apply.group("target")).lower()
+                    
+                    # 1. Check Main
+                    if current_username and target == current_username:
                         self.agony_active_until = now + 12.0
                         self.agony_cooldown_until = now + 25.0
-                
+                    
+                    # 2. Check Extras
+                    for v in self.agony_users_vars:
+                         val = v.get().strip()
+                         if val and val.lower() == target:
+                             self.agony_states[target] = {
+                                 "active_until": now + 12.0,
+                                 "cooldown_until": now + 25.0,
+                                 "name": val
+                             }
+
                 m_cancel = AURA_CANCEL_RE.search(line)
                 if m_cancel and m_cancel.group("aura") == "BuffNearDeath_big":
-                    if _strip_id(m_cancel.group("target")).lower() == current_username:
+                    target = _strip_id(m_cancel.group("target")).lower()
+                    
+                    if current_username and target == current_username:
                         self.agony_active_until = 0.0
+                        
+                    if target in self.agony_states:
+                        self.agony_states[target]["active_until"] = 0.0
 
             # Torpedoes
             if self.enable_torp_var.get():
@@ -474,7 +632,42 @@ class CombatAssistantModule(BaseModule):
                         self.bomb_ally_carried = False
 
     # --- Scanning & Visuals ---
+    def _update_focus_debug(self):
+        """Checks focus state and prints debug info only if state changes."""
+        try:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if hwnd == 0:
+                current_state = "unknown"
+                current_window = "None"
+            else:
+                length = 256
+                buff = ctypes.create_unicode_buffer(length)
+                ctypes.windll.user32.GetClassNameW(hwnd, buff, length)
+                current_window = buff.value
+                
+                if current_window == "game_main_window":
+                    current_state = "game"
+                else:
+                    current_state = "other"
+            
+            # Print only on transition
+            if self._last_focus_state != current_state:
+                if current_state == "game":
+                    print(f"[DEBUG] Game window FOCUSED ({current_window})")
+                elif current_state == "other":
+                     print(f"[DEBUG] Focus LOST. Current window: '{current_window}'")
+                elif current_state == "unknown":
+                     print(f"[DEBUG] Focus Unknown.")
+                
+                self._last_focus_state = current_state
+                
+        except Exception:
+            pass
+
     def _schedule_scan(self):
+        # Update focus debug regularly (outside thread to avoid print race conditions, though simple print is atomic enough)
+        self._update_focus_debug()
+
         # We start a thread to run the scan logic, checking first if one is already running
         # This prevents UI Lag
         if not self.frame: return
@@ -488,26 +681,29 @@ class CombatAssistantModule(BaseModule):
 
     def _run_scan_thread(self):
         # Heavy lifting here
-        with self.scan_lock:
-             # Logic for features
-             if self.enable_bomb_var.get():
-                self._scan_bombs()
-            
-             if self.enable_capture_var.get():
-                 self._scan_capture()
-             else:
-                 # Even if capture logic is disabled, if we have points set, we might want to update the debug labels 
-                 # (show just coordinates) or do a passive scan?
-                 # User asked for "detected color" to be displayed.
-                 # If disabled, maybe we should still read the pixel ONLY for the UI if points are set?
-                 # Let's check points.
-                 if self.points:
-                     # Minimal scan just for UI
-                     debug_vals = {}
-                     for name in ["cmd", "shield", "weapon"]:
-                         if name in self.points:
-                             debug_vals[name] = self.scanner.get_pixel_color(*self.points[name])
-                     self.app.after(0, self._apply_debug_labels, debug_vals)
+        try:
+            with self.scan_lock:
+                 # Logic for features
+                 if self.enable_bomb_var.get():
+                    self._scan_bombs()
+                
+                 if self.enable_capture_var.get():
+                     self._scan_capture()
+                 else:
+                     # Even if capture logic is disabled, if we have points set, we might want to update the debug labels 
+                     # (show just coordinates) or do a passive scan?
+                     # User asked for "detected color" to be displayed.
+                     # If disabled, maybe we should still read the pixel ONLY for the UI if points are set?
+                     # Let's check points.
+                     if self.points:
+                         # Minimal scan just for UI
+                         debug_vals = {}
+                         for name in ["cmd", "shield", "weapon"]:
+                             if name in self.points:
+                                 debug_vals[name] = self.scanner.get_pixel_color(*self.points[name])
+                         self.app.after(0, self._apply_debug_labels, debug_vals)
+        except Exception as e:
+            print(f"[DEBUG] Error in scan thread: {e}")
 
     def _update_capture_debug(self):
         # This runs on main thread, quick check of LAST known values?
@@ -530,40 +726,75 @@ class CombatAssistantModule(BaseModule):
 
     def _scan_bombs(self):
         # Runs in Thread
+        
+        # Only scan if we are reliably in a match to avoid lobby/hangar false positives
+        if not self.match_active_signal:
+            return
+            
         now = time.time()
         
         # Scan Ally
         if "ally_roster" in self.regions:
-            has_bomb = self.scanner.find_template(self.regions["ally_roster"], "bomb_ally")
+            # Set to 30 to be VERY STRICT to avoid false positives
+            has_bomb = self.scanner.find_template(self.regions["ally_roster"], "bomb_ally", threshold=30)
             
             if has_bomb:
-                self.bomb_ally_last_seen = now
-                
-                # Logic: If newly picked up by Ally
                 if not self.bomb_ally_carried:
-                     # Pickup Event
-                     self.bomb_ally_respawn_time = now + 120
-                     self.bomb_ally_carried = True
+                    print(f"[DEBUG] Bomb ALLY detected (State Change)!")
+                self.bomb_ally_last_seen = now
+                self.bomb_ally_carried = True
+                
+                # Logic: Maintain Timer (See Enemy Logic)
+                if now < self.bomb_ally_respawn_time:
+                     pass
+                else:
+                     self.bomb_ally_respawn_time = now + 120.0
             else:
                 # Not seen. Check grace period.
                 if (now - self.bomb_ally_last_seen) > self.BOMB_GRACE_PERIOD:
+                    if self.bomb_ally_carried:
+                         print(f"[DEBUG] Bomb ALLY lost (grace period expired)")
                     self.bomb_ally_carried = False
+        else:
+             # throttle warning
+             if int(now) % 10 == 0: print("[DEBUG] 'ally_roster' region not set, skipping ally scan.")
             
         # Scan Enemy
         if "enemy_roster" in self.regions:
-            has_bomb = self.scanner.find_template(self.regions["enemy_roster"], "bomb_enemy")
+            # Set to 30 to be VERY STRICT to avoid false positives
+            has_bomb = self.scanner.find_template(self.regions["enemy_roster"], "bomb_enemy", threshold=30)
             
             if has_bomb:
-                self.bomb_enemy_last_seen = now
-                # Logic: If newly picked up by Enemy
                 if not self.bomb_enemy_carried:
-                     self._play_sound(SND_BOMB)
-                     self.bomb_respawn_time = now + 120
-                     self.bomb_enemy_carried = True
+                     print(f"[DEBUG] Bomb ENEMY detected (State Change)!")
+                self.bomb_enemy_last_seen = now
+                self.bomb_enemy_carried = True
+                
+                # Logic: Maintain Timer
+                # "When the bomb is detected, start the timer and display it."
+                # "Do not refresh the timer in case the program loses the bomb and finds it again within those two minutes"
+                # "When the two minutes are over... start the timer again"
+                
+                # Check if we have an active timer that is valid (in future)
+                if now < self.bomb_respawn_time:
+                    # Timer is running. Do NOT refresh it.
+                    pass
+                else:
+                    # No Active Timer (or Expired). Start Clean 2 Minute Timer.
+                    # This covers:
+                    # 1. First pickup.
+                    # 2. Re-pickup after timer expiration.
+                    print(f"[DEBUG] Enemy Bomb pickup confirmed (new timer/sound)")
+                    self._play_sound(SND_BOMB)
+                    self.bomb_respawn_time = now + 120.0
             else:
                 # Not seen
                 if (now - self.bomb_enemy_last_seen) > self.BOMB_GRACE_PERIOD:
+                    if self.bomb_enemy_carried:
+                         print(f"[DEBUG] Bomb ENEMY lost (grace period expired)")
                     self.bomb_enemy_carried = False
+        else:
+             if int(now) % 10 == 0: print("[DEBUG] 'enemy_roster' region not set, skipping enemy scan.")
 
     def _scan_capture(self):
         # Runs in Thread
@@ -637,13 +868,34 @@ class CombatAssistantModule(BaseModule):
             self._play_sound(filename)
             self.last_capture_sound[name] = now
 
+    def _is_game_foreground(self) -> bool:
+        """Checks if the game window is currently in the foreground."""
+        try:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if hwnd == 0:
+                return False
+            
+            length = 256
+            buff = ctypes.create_unicode_buffer(length)
+            ctypes.windll.user32.GetClassNameW(hwnd, buff, length)
+            current_class = buff.value
+            
+            # Check for Star Conflict window class "game_main_window"
+            is_game = (current_class == "game_main_window")
+            
+            return is_game
+        except Exception:
+            return False
+
     def _sound_worker(self):
         while True:
             path_str = self.sound_queue.get()
             try:
-                import winsound
-                # SND_SYNC blocks, ensuring sequential playback
-                winsound.PlaySound(path_str, winsound.SND_SYNC | winsound.SND_FILENAME)
+                # Only play if game is focused
+                if self._is_game_foreground():
+                    import winsound
+                    # SND_SYNC blocks, ensuring sequential playback
+                    winsound.PlaySound(path_str, winsound.SND_SYNC | winsound.SND_FILENAME)
             except Exception:
                 pass
             finally:
@@ -671,9 +923,39 @@ class CombatAssistantModule(BaseModule):
              return
 
         # Logic Check
-        # Show if matched started OR recent damage (< 60s)
+        # Show if (match started) OR (recent damage < 60s)
+        # CRITICAL FIX: Even if match is "Active", we rely on log activity to decide if we are actually PLAYING.
+        # But wait, user said "display message when program detects window is game".
+        # This auto-hide request implies: "If I am afk in space (no damage) even in a match, maybe hide?"
+        # The user's request: "auto hide works again, when no important log activity... is detected"
+        # Since 'match_active_signal' stays True for the whole match 20mins+, this forces it ALWAYS on.
+        # We need to qualify 'match_active_signal' with activity or just rely entirely on activity?
+        # A compromise: If match_active_signal is True, we usually WANT it on.
+        # But maybe the user means AFTER the match ends? 
+        # Or maybe they specifically mean "If I haven't taken damage for X time, hide it".
+        
+        # User phrasing: "auto hide works again, when no important log activity ... is detected"
+        # This suggests strictly time-based activity checking.
+        
         now = time.time()
-        should_show = self.match_active_signal or (now - self.last_damage_time < 60.0)
+        
+        # We treat 'match_active_signal' as a prerequisite, but activity as the trigger?
+        # No, 'Start gameplay' IS a trigger.
+        # Let's combine them: 
+        # Visible IF: (Match Is Active) AND (Recent Activity < 60s)
+        # But sitting in space waiting for bomb is idle. We don't want it to hide then.
+        
+        # Re-reading: "Wait for significant log activity... and check lines in reverse... until Start gameplay found"
+        # The user seems to want the *Initial* appearance to be activity based.
+        # But "auto hide" implies disappearing later.
+        
+        # Let's effectively change logic to:
+        # Show IF: (Recent Damage < 60s)
+        # The 'match_active_signal' is just state tracking.
+        # However, we want it to show up when Bomb timer is running?
+        # Let's stick to the user's specific text: "auto hide works again, when no important log activity"
+        
+        should_show = (now - self.last_damage_time < 60.0)
         
         if should_show and not self._is_visible:
              if self.overlay: self.overlay.show()
@@ -688,27 +970,74 @@ class CombatAssistantModule(BaseModule):
             
         now = time.time()
         
+        # Ensure multi lists exists
+        if not hasattr(self, "agony_multi_labels"):
+            self.agony_multi_labels = []
+
         # Unpack all to ensure strict order on repack
         self.agony_label.pack_forget()
+        for l in self.agony_multi_labels: l.pack_forget()
+        
         self.torp_label.pack_forget()
         self.bomb_ally_label.pack_forget()
         self.bomb_enemy_label.pack_forget()
         
         # 1. Agony
-        if self.enable_agony_var.get():
-            self.agony_label.pack(anchor="w")
-            if now < self.agony_active_until:
-                # Active -> Green
-                self.agony_label.config(text=f"Agony buff: ACTIVE {int(self.agony_active_until - now)}s", fg="#33ff33")
-            elif now < self.agony_cooldown_until:
-                # CD -> Red
-                self.agony_label.config(text=f"Agony buff: CD {int(self.agony_cooldown_until - now)}s", fg="#ff3333")
+        if self.enable_agony_var.get() and self.match_active_signal:
+            extras = [v.get().strip() for v in self.agony_users_vars if v.get().strip()]
+            
+            if not extras:
+                # Single (Original) Mode
+                self.agony_label.pack(anchor="w")
+                if now < self.agony_active_until:
+                    # Active -> Yellow
+                    self.agony_label.config(text=f"Agony buff: ACTIVE {int(self.agony_active_until - now)}s", fg="#ffff33")
+                elif now < self.agony_cooldown_until:
+                    # CD -> Red
+                    self.agony_label.config(text=f"Agony buff: CD {int(self.agony_cooldown_until - now)}s", fg="#ff3333")
+                else:
+                    # Ready -> Green
+                    self.agony_label.config(text="Agony buff: READY", fg="#33ff33")
             else:
-                # Ready -> Yellow
-                self.agony_label.config(text="Agony buff: READY", fg="#ffff33")
+                # Multi User Mode
+                self.agony_label.pack(anchor="w")
+                self.agony_label.config(text="Agony buff:", fg="white")
+                
+                # Gather items
+                items = []
+                # Main
+                main_name = self.config.username if self.config.username else "Main"
+                items.append((main_name, self.agony_active_until, self.agony_cooldown_until))
+                
+                # Extras
+                for name in extras:
+                    state = self.agony_states.get(name.lower(), {})
+                    items.append((name, state.get("active_until", 0.0), state.get("cooldown_until", 0.0)))
+                
+                # Ensure labels
+                while len(self.agony_multi_labels) < len(items):
+                    font_px = ("Segoe UI", -16, "bold")
+                    l = tk.Label(self.overlay.container, font=font_px, bg="black", fg="white")
+                    self.agony_multi_labels.append(l)
+                
+                # Update
+                for i, (name, active, cd) in enumerate(items):
+                    lbl = self.agony_multi_labels[i]
+                    lbl.pack(anchor="w", padx=(20, 0))
+                    
+                    if now < active:
+                        # Active -> Yellow
+                        lbl.config(text=f"{name}: ACTIVE {int(active - now)}s", fg="#ffff33")
+                    elif now < cd:
+                        # CD -> Red
+                        lbl.config(text=f"{name}: CD {int(cd - now)}s", fg="#ff3333")
+                    else:
+                        # Ready -> Green
+                        lbl.config(text=f"{name}: READY", fg="#33ff33")
 
         # 2. Torpedoes
-        if self.enable_torp_var.get():
+        # Only show if enabled AND in Conquest mode (ClanShip)
+        if self.enable_torp_var.get() and self.match_is_conquest:
             self.torp_label.pack(anchor="w")
             if now < self.torp_next_wave:
                  rem = int(self.torp_next_wave - now)
@@ -717,7 +1046,8 @@ class CombatAssistantModule(BaseModule):
                  self.torp_label.config(text="Torpedos: READY", fg="#33ff33")
 
         # 3. Bombs
-        if self.enable_bomb_var.get():
+        # Only show if enabled AND in Conquest mode
+        if self.enable_bomb_var.get() and self.match_is_conquest:
             self.bomb_ally_label.pack(anchor="w")
             self.bomb_enemy_label.pack(anchor="w")
             
@@ -872,6 +1202,11 @@ class CombatAssistantModule(BaseModule):
                 data = json.loads(self.settings_file.read_text())
                 self.regions = {k: tuple(v) for k,v in data.get("regions", {}).items()}
                 self.points = {k: tuple(v) for k,v in data.get("points", {}).items()}
+                
+                # Agony Users
+                ag_users = data.get("agony_users", [])
+                self.agony_users_vars = [tk.StringVar(value=u) for u in ag_users]
+                
                 self.enable_agony_var.set(data.get("agony", False))
                 self.enable_bomb_var.set(data.get("bomb", False))
                 self.enable_torp_var.set(data.get("torp", False))
@@ -895,6 +1230,7 @@ class CombatAssistantModule(BaseModule):
             "regions": self.regions,
             "points": self.points,
             "agony": self.enable_agony_var.get(),
+            "agony_users": [v.get() for v in self.agony_users_vars],
             "bomb": self.enable_bomb_var.get(),
             "torp": self.enable_torp_var.get(),
             "capture": self.enable_capture_var.get(),
