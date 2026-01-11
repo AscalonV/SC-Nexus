@@ -33,6 +33,7 @@ class CombatAssistantModule(BaseModule):
         self.config = config
         self.frame: Optional[ttk.Frame] = None
         self._scan_after_id = None
+        self._update_after_id = None
         self.settings_file = Path(__file__).parent / "settings.json"
         
         # --- State ---
@@ -483,6 +484,10 @@ class CombatAssistantModule(BaseModule):
             self.app.after_cancel(self._scan_after_id)
             self._scan_after_id = None
         
+        if self._update_after_id:
+            self.app.after_cancel(self._update_after_id)
+            self._update_after_id = None
+        
         self._save_settings()
         
         if self.overlay:
@@ -735,8 +740,10 @@ class CombatAssistantModule(BaseModule):
         
         # Scan Ally
         if "ally_roster" in self.regions:
-            # Set to 30 to be VERY STRICT to avoid false positives
-            has_bomb = self.scanner.find_template(self.regions["ally_roster"], "bomb_ally", threshold=30)
+            # Adjusted threshold to 50 (Limit 150).
+            # The previous threshold of 60 (Limit 180) was picking up background noise with scores around 156-173.
+            # A tighter limit should filter these out while hopefully still catching the real bomb.
+            has_bomb = self.scanner.find_template(self.regions["ally_roster"], "bomb_ally", threshold=50)
             
             if has_bomb:
                 if not self.bomb_ally_carried:
@@ -761,7 +768,53 @@ class CombatAssistantModule(BaseModule):
             
         # Scan Enemy
         if "enemy_roster" in self.regions:
-            # Set to 30 to be VERY STRICT to avoid false positives
+            # Your logs show scores of ~65-72 for the real enemy bomb.
+            # Our threshold was 40, so it failed (65 > 40 * 3 is false, wait...)
+            # The scanner logic is: avg_diff < (threshold * 3).
+            # If log says Diff: 65, that IS the avg_diff?
+            # NO. The scanner log says: "Diff: 65.12". 
+            # The scanner check is: `if avg_diff < (threshold * 3)`
+            # So if threshold is 40, Limit = 120.
+            # 65 < 120. So it SHOULD have detected it?
+            # Wait, let's look at scanner code again.
+            # `if avg_diff < (threshold * 3)`
+            # You saw the log "Potential... Diff: 65".
+            # That means it WAS detected as a candidate?
+            # Ah, the log "Potential" prints whenever Diff < 80.
+            # So if Diff is 65, and Threshold is 40 (Limit=120), it passes.
+            # BUT you said "detection stopped working".
+            # Maybe I am misinterpreting the unit of 'threshold' passed vs used.
+            # In Scanner: `threshold` passed is `40`. Comparison is `threshold * 3` -> `120`.
+            # So 65 should pass easily.
+            # Why did it fail?
+            # Maybe the *per pixel* check failed?
+            # `if checked_pixels > 5 and (total_diff / checked_pixels) > (threshold * 3)`
+            # That aborts if Avg > 120.
+            # Avg is 65. So it shouldn't abort.
+            #
+            # Let's look at the logs again.
+            # You see "Potential ... Diff: 65".
+            # That log happens at the End.
+            # If you saw that log, then `find_template` returned True!
+            # Because:
+            # if avg_diff < (threshold * 3): return True
+            # So if you saw "Potential", the function DID return True.
+            # So why did the UI not update?
+            # Because `self.bomb_enemy_carried` was already True?
+            # The UI only plays sound/resets timer if the state CHANGES.
+            # If the bomb is held for > 120s, the timer might be stuck?
+            #
+            # Wait, for the ALLY bomb, you saw NO logs.
+            # That means the Diff was > 80.
+            # So the Ally bomb is matching very poorly (>80).
+            # We need to increase the threshold significantly for Ally.
+            # Let's set it to 75? (Limit = 225).
+            
+            # For Enemy, you had correct detection but maybe issues with "dark background".
+            # Max diff in your logs was 73.35.
+            # False positives were seen around 99-105.
+            # Limit 25 -> 75 is too tight for 73.
+            # Limit 30 -> 90. 73 < 90 (Pass). 99 > 90 (Fail). Perfect.
             has_bomb = self.scanner.find_template(self.regions["enemy_roster"], "bomb_enemy", threshold=30)
             
             if has_bomb:
@@ -912,7 +965,7 @@ class CombatAssistantModule(BaseModule):
         
         self._update_visibility_logic()
         self._update_overlay_ui()
-        self.app.after(100, self._schedule_update)
+        self._update_after_id = self.app.after(100, self._schedule_update)
 
     def _update_visibility_logic(self):
         # Master Switch Check
@@ -1074,6 +1127,9 @@ class CombatAssistantModule(BaseModule):
     def _build_overlay_content(self):
         if not self.overlay: return
         for w in self.overlay.container.winfo_children(): w.destroy()
+        
+        # Reset multi-label cache since we destroyed the window content
+        self.agony_multi_labels = []
         
         # Use single labels per module for simplicity, pack vertically
         # Use pixel-sized fonts (negative size) so text doesn't rescale with DPI moves

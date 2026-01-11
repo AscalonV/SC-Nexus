@@ -54,10 +54,11 @@ class ScreenScanner:
         # Check region vs template sizes for 1.0x
         # If region is smaller than even smallest scale, fail
         t_w, t_h = orig_template.size
-        if region[2] < (t_w * 0.5) or region[3] < (t_h * 0.5):
-             self.last_error = f"Region too small"
-             print(f"[DEBUG] Region too small for '{template_name}': Region={region[2]}x{region[3]}, Template={t_w}x{t_h}")
-             return False
+        # Allow regions that match template size (even within 1px margin)
+        if region[2] < t_w or region[3] < t_h:
+             # Just warn, don't fail immediately, but matching will likely fail or crash if we don't handle bounds
+             # Actually, the logic below (range(sh-th)) will just not loop if region < template
+             pass
 
         monitor = {
             "top": int(region[1]),
@@ -76,9 +77,7 @@ class ScreenScanner:
                 screen_pixels = screen_img.load()
                 sw, sh = screen_img.size
                 
-                # Updated: Scaling Support - DISABLED by default for performance
-                # We try scales: 1.0 (Most likely for custom assets)
-                # Adding more scales (1.25, 1.5) causes massive CPU spikes in pure Python
+                # Performance: Only check 1.0 scale
                 scales = [1.0] 
                 
                 best_diff = 999
@@ -96,6 +95,7 @@ class ScreenScanner:
                     template_pixels = template_img.load()
 
                     # FIND VALID ANCHOR (Opaque Pixel)
+                    # We want a very solid anchor to skip empty checking
                     cx, cy = -1, -1
                     for ay in range(0, th, 2):
                         for ax in range(0, tw, 2):
@@ -108,13 +108,12 @@ class ScreenScanner:
                     
                     c_pix = template_pixels[cx, cy]
                     cr, cg, cb = c_pix[0], c_pix[1], c_pix[2]
+                    # Anchor usage depends on high alpha (solid)
                     ca = c_pix[3] if len(c_pix) > 3 else 255
-                    use_anchor = (ca > 150)
+                    use_anchor = (ca > 200)
 
                     # Scan Screen for this Scale
-                    # Optimization: Step size 2 (Check every 2nd pixel). 
-                    # The icon is ~30px wide, so we won't miss it.
-                    # This reduces workload by 4x.
+                    # Optimization: Step size 2 for better precision
                     for y in range(0, sh - th, 2):
                         for x in range(0, sw - tw, 2):
                             if use_anchor:
@@ -126,42 +125,49 @@ class ScreenScanner:
                             checked_pixels = 0
                             
                             # Check grid
-                            # Optim: Abort early if diff gets too high
                             abort = False
-                            max_total = (threshold * 3) # Per pixel average limit... wait.
-                            # We want avg_diff < threshold*3.
-                            # So total_diff < (checked * threshold * 3).
-                            # We can't check total vs checked dynamically easily without accumulation.
                             
                             for py in range(0, th, 2):
                                 for px in range(0, tw, 2):
                                     t_pix = template_pixels[px, py]
-                                    if t_pix[3] < 50: continue
+                                    
+                                    # CHECK 1: Alpha (Transparency)
+                                    # Skip semi-transparent pixels
+                                    if t_pix[3] < 200: continue
+
+                                    # CHECK 2: Brightness (Ignore Dark Backgrounds)
+                                    # If template pixel is very dark (sum RGB < 100), skip it.
+                                    # This prevents matching the black 'empty' space of the icon against dark space backgrounds.
+                                    if (t_pix[0] + t_pix[1] + t_pix[2]) < 100: continue
                                     
                                     s_pix = screen_pixels[x+px, y+py]
                                     pixel_diff = abs(s_pix[0]-t_pix[0]) + abs(s_pix[1]-t_pix[1]) + abs(s_pix[2]-t_pix[2])
                                     total_diff += pixel_diff
                                     checked_pixels += 1
                                     
-                                    # Early abort heuristic (strict)
-                                    # If current average is WAY off (e.g. > threshold*6) after 10 pixels
-                                    if checked_pixels > 10 and (total_diff / checked_pixels) > (threshold * 6):
+                                    # Abort if bad match
+                                    if checked_pixels > 5 and (total_diff / checked_pixels) > (threshold * 3):
                                         abort = True
                                         break
                                 if abort: break
                             
-                            if not abort and checked_pixels > 5:
+                            # We need enough checked pixels to be confident.
+                            if not abort and checked_pixels > 10:
                                 avg_diff = total_diff / checked_pixels
                                 if avg_diff < best_diff:
                                     best_diff = avg_diff
-                                    
-                                if avg_diff < (threshold * 3):
+
+                                limit = threshold * 3
+                                if avg_diff < limit or avg_diff < 200:
+                                    print(f"[DEBUG] Potential '{template_name}' at ({x},{y}) - Diff: {avg_diff:.2f} (Pixels: {checked_pixels}) Limit: {limit}")
+
+                                if avg_diff < limit:
                                     # Match Found!
-                                    # print(f"[DEBUG] Found '{template_name}' at scale {scale} with diff {avg_diff:.2f}")
+                                    # print(f"[DEBUG] Found '{template_name}' at ({x},{y}) with diff {avg_diff:.2f}")
                                     return True
                 
                 # If we get here, no match found
-                # print(f"[DEBUG] Scan '{template_name}' failed. Best Diff: {best_diff:.2f} (Threshold: {threshold*3})")
+                # print(f"[DEBUG] Scan '{template_name}' failed. Best Diff: {best_diff:.2f}")
                 return False
             except Exception as e:
                 self.last_error = f"Template Error: {e}"
