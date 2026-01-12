@@ -75,19 +75,41 @@ class OverlayWindow(tk.Toplevel):
 
     def _safe_place(self, x, y):
         """Place window at specific physical coordinates using Windows API."""
+        self._target_x = int(x)
+        self._target_y = int(y)
         try:
             if sys.platform == "win32":
-                x = int(x)
-                y = int(y)
                 # Use DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4) to ensure coordinates 
                 # are treated as physical screen coordinates without virtualization/scaling.
                 ctx_prev = self._set_thread_dpi(self._DPI_PER_MON_V2)
                 hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
                 # SWP_NOSIZE (0x0001) | SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010)
-                ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
+                ctypes.windll.user32.SetWindowPos(hwnd, 0, self._target_x, self._target_y, 0, 0, 0x0001 | 0x0004 | 0x0010)
                 self._restore_thread_dpi(ctx_prev)
+                return
         except Exception:
             pass
+
+        # Fallback to Tk geometry if SetWindowPos fails or on non-Windows
+        try:
+            self.geometry(f"+{self._target_x}+{self._target_y}")
+        except Exception:
+            pass
+
+    def set_target_position(self, x: int, y: int, apply: bool = False):
+        """Persist desired coordinates and optionally move immediately."""
+        self._target_x = int(x)
+        self._target_y = int(y)
+        if apply:
+            self._safe_place(self._target_x, self._target_y)
+
+    def ensure_position(self, tolerance: int = 2) -> bool:
+        """Force window back to target if it drifts (e.g., DPI moves)."""
+        cur_x, cur_y = self.get_physical_position()
+        if abs(cur_x - self._target_x) > tolerance or abs(cur_y - self._target_y) > tolerance:
+            self._safe_place(self._target_x, self._target_y)
+            return True
+        return False
 
     def _set_thread_dpi(self, ctx):
         if sys.platform != "win32":
@@ -293,6 +315,8 @@ class OverlayWindow(tk.Toplevel):
 
     def show(self):
         self.deiconify()
+        # Re-pin position in case Windows/Tk moved us
+        self.after(10, lambda: self._safe_place(self._target_x, self._target_y))
         # Re-apply clickthrough after showing
         self.after(100, lambda: self.set_clickthrough(self._clickthrough))
 

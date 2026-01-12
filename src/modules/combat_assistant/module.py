@@ -311,6 +311,7 @@ class CombatAssistantModule(BaseModule):
         # Initialize Overlay
         if not self.overlay:
             self.overlay = OverlayWindow(self.app, x=self.overlay_x, y=self.overlay_y, on_move=self._on_overlay_move)
+            self.overlay.set_target_position(self.overlay_x, self.overlay_y, apply=True)
             self._build_overlay_content()
             self._update_overlay_visibility()
             # Try to force a geometry update or resize hint if on different DPI?
@@ -969,6 +970,8 @@ class CombatAssistantModule(BaseModule):
     def _update_overlay_ui(self):
         if not self.overlay or not self._is_visible:
             return
+        if not self.overlay_editing:
+            self.overlay.ensure_position()
             
         now = time.time()
         
@@ -1106,6 +1109,8 @@ class CombatAssistantModule(BaseModule):
             return
         self.overlay_x = x
         self.overlay_y = y
+        if self.overlay:
+            self.overlay.set_target_position(x, y)
         self._save_settings()
 
     def _toggle_overlay_edit(self):
@@ -1118,6 +1123,7 @@ class CombatAssistantModule(BaseModule):
                 # Persist final position when leaving edit mode
                 pos = self.overlay.get_physical_position()
                 self.overlay_x, self.overlay_y = pos
+                self.overlay.set_target_position(self.overlay_x, self.overlay_y)
                 self._save_settings()
             if mode: self.overlay.show() 
 
@@ -1230,6 +1236,7 @@ class CombatAssistantModule(BaseModule):
             pos_x, pos_y = self.overlay.get_physical_position()
             self.overlay_x = pos_x
             self.overlay_y = pos_y
+            self.overlay.set_target_position(self.overlay_x, self.overlay_y)
             
         data = {
             "regions": self.regions,
