@@ -119,17 +119,9 @@ class LogTailer:
     def _read_new_lines(self) -> List[str]:
         if not self._file_handle:
             return []
-        
-        lines = []
         try:
-            # Read all available
-            while True:
-                line = self._file_handle.readline()
-                if not line:
-                    break
-                lines.append(line)
-            
+            lines = self._file_handle.readlines()
             self.line_count += len(lines)
+            return lines
         except Exception:
-            pass
-        return lines
+            return []

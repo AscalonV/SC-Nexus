@@ -370,6 +370,7 @@ class CombatAssistantModule(BaseModule):
                     ):
                         self.match_active_signal = False
                         self.match_is_conquest = False
+                        self.last_damage_time = 0.0
                         self._update_visibility_logic()
                         return
 
@@ -515,6 +516,7 @@ class CombatAssistantModule(BaseModule):
             # User update: check for "Start gameplay"
             if "Start gameplay" in line:
                 self.match_active_signal = True
+                self.last_damage_time = now  # Treat match start as activity to avoid delayed show
                 
                 # Check for Conquest Mode (ClanShip)
                 if "'ClanShip'" in line:
@@ -545,6 +547,7 @@ class CombatAssistantModule(BaseModule):
                 self.match_is_conquest = False # Reset
                 self.agony_active_until = 0.0
                 self.agony_cooldown_until = 0.0
+                self.last_damage_time = 0.0
                 self._update_visibility_logic()
 
             # Agony
@@ -916,6 +919,13 @@ class CombatAssistantModule(BaseModule):
                  self.overlay.hide() if self.overlay else None
                  self._is_visible = False
              return
+
+        # If no match is active, keep overlay hidden to avoid flicker after match end.
+        if not self.match_active_signal:
+            if self._is_visible and self.overlay:
+                self.overlay.hide()
+            self._is_visible = False
+            return
 
         # Logic Check
         # Show if (match started) OR (recent damage < 60s)
