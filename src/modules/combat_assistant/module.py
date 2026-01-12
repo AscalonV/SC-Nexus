@@ -981,15 +981,19 @@ class CombatAssistantModule(BaseModule):
 
         # Unpack all to ensure strict order on repack
         self.agony_label.pack_forget()
-        for l in self.agony_multi_labels: l.pack_forget()
+        for l in self.agony_multi_labels:
+            l.pack_forget()
         
         self.torp_label.pack_forget()
         self.bomb_ally_label.pack_forget()
         self.bomb_enemy_label.pack_forget()
+
+        conquest_visible = False
         
         # 1. Agony
         if self.enable_agony_var.get() and self.match_active_signal:
             extras = [v.get().strip() for v in self.agony_users_vars if v.get().strip()]
+            multi_mode = bool(extras)
             
             if not extras:
                 # Single (Original) Mode
@@ -1022,7 +1026,7 @@ class CombatAssistantModule(BaseModule):
                 # Ensure labels
                 while len(self.agony_multi_labels) < len(items):
                     font_px = ("Segoe UI", -16, "bold")
-                    l = tk.Label(self.overlay.container, font=font_px, bg="black", fg="white")
+                    l = tk.Label(self.overlay_left_frame, font=font_px, bg="black", fg="white")
                     self.agony_multi_labels.append(l)
                 
                 # Update
@@ -1039,10 +1043,13 @@ class CombatAssistantModule(BaseModule):
                     else:
                         # Ready -> Green
                         lbl.config(text=f"{name}: READY", fg="#33ff33")
+        else:
+            multi_mode = False
 
         # 2. Torpedoes
         # Only show if enabled AND in Conquest mode (ClanShip)
         if self.enable_torp_var.get() and self.match_is_conquest:
+            conquest_visible = True
             self.torp_label.pack(anchor="w")
             if now < self.torp_next_wave:
                  rem = int(self.torp_next_wave - now)
@@ -1053,6 +1060,7 @@ class CombatAssistantModule(BaseModule):
         # 3. Bombs
         # Only show if enabled AND in Conquest mode
         if self.enable_bomb_var.get() and self.match_is_conquest:
+            conquest_visible = True
             self.bomb_ally_label.pack(anchor="w")
             self.bomb_enemy_label.pack(anchor="w")
             
@@ -1076,20 +1084,49 @@ class CombatAssistantModule(BaseModule):
             else:
                 self.bomb_enemy_label.config(text="Enemy Bomb: READY", fg="#33ff33")
 
+        self._layout_overlay_frames(multi_mode, conquest_visible)
+
     def _build_overlay_content(self):
         if not self.overlay: return
         for w in self.overlay.container.winfo_children(): w.destroy()
         
         # Reset multi-label cache since we destroyed the window content
         self.agony_multi_labels = []
-        
-        # Use single labels per module for simplicity, pack vertically
+
+        # Two-column capable layout
+        self.overlay.container.grid_columnconfigure(0, weight=1)
+        self.overlay.container.grid_columnconfigure(1, weight=1)
+
+        self.overlay_left_frame = tk.Frame(self.overlay.container, bg="black")
+        self.overlay_right_frame = tk.Frame(self.overlay.container, bg="black")
+
         # Use pixel-sized fonts (negative size) so text doesn't rescale with DPI moves
         font_px = ("Segoe UI", -16, "bold")
-        self.agony_label = tk.Label(self.overlay.container, text="Agony buff: READY", font=font_px, bg="black", fg="white")
-        self.torp_label = tk.Label(self.overlay.container, text="Torpedos: READY", font=font_px, bg="black", fg="white")
-        self.bomb_ally_label = tk.Label(self.overlay.container, text="Allied Bomb: READY", font=font_px, bg="black", fg="white")
-        self.bomb_enemy_label = tk.Label(self.overlay.container, text="Enemy Bomb: READY", font=font_px, bg="black", fg="white")
+        self.agony_label = tk.Label(self.overlay_left_frame, text="Agony buff: READY", font=font_px, bg="black", fg="white")
+        self.torp_label = tk.Label(self.overlay_right_frame, text="Torpedos: READY", font=font_px, bg="black", fg="white")
+        self.bomb_ally_label = tk.Label(self.overlay_right_frame, text="Allied Bomb: READY", font=font_px, bg="black", fg="white")
+        self.bomb_enemy_label = tk.Label(self.overlay_right_frame, text="Enemy Bomb: READY", font=font_px, bg="black", fg="white")
+
+    def _layout_overlay_frames(self, multi_mode: bool, show_conquest: bool):
+        if not self.overlay:
+            return
+
+        # Reset geometry before re-applying
+        if hasattr(self, "overlay_left_frame"):
+            self.overlay_left_frame.grid_forget()
+        if hasattr(self, "overlay_right_frame"):
+            self.overlay_right_frame.grid_forget()
+
+        if not hasattr(self, "overlay_left_frame") or not hasattr(self, "overlay_right_frame"):
+            return
+
+        if multi_mode and show_conquest:
+            self.overlay_left_frame.grid(row=0, column=0, sticky="nw")
+            self.overlay_right_frame.grid(row=0, column=1, sticky="nw", padx=(16, 0))
+        else:
+            self.overlay_left_frame.grid(row=0, column=0, sticky="nw")
+            if show_conquest:
+                self.overlay_right_frame.grid(row=1, column=0, sticky="nw", pady=(8, 0))
 
     def _toggle_overlay_vis(self):
         # Just toggle the master switch. Logic handles the rest.
