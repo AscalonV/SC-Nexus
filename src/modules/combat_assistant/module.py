@@ -729,6 +729,17 @@ class CombatAssistantModule(BaseModule):
         # Let's just read pixels in thread.
         pass
 
+    def _has_multiple_bomb_icons(self, positions, min_distance: int = 10) -> bool:
+        if not positions or len(positions) < 2:
+            return False
+        for i in range(len(positions)):
+            for j in range(i + 1, len(positions)):
+                dx = abs(positions[i][0] - positions[j][0])
+                dy = abs(positions[i][1] - positions[j][1])
+                if max(dx, dy) >= min_distance:
+                    return True
+        return False
+
     def _scan_bombs(self):
         # Runs in Thread
         
@@ -737,117 +748,55 @@ class CombatAssistantModule(BaseModule):
             return
             
         now = time.time()
-        
-        # Scan Ally
-        if "ally_roster" in self.regions:
-            # Adjusted threshold to 50 (Limit 150).
-            # The previous threshold of 60 (Limit 180) was picking up background noise with scores around 156-173.
-            # A tighter limit should filter these out while hopefully still catching the real bomb.
-            has_bomb = self.scanner.find_template(self.regions["ally_roster"], "bomb_ally", threshold=50)
-            
-            if has_bomb:
-                if not self.bomb_ally_carried:
-                    print(f"[DEBUG] Bomb ALLY detected (State Change)!")
-                self.bomb_ally_last_seen = now
-                self.bomb_ally_carried = True
-                
-                # Logic: Maintain Timer (See Enemy Logic)
-                if now < self.bomb_ally_respawn_time:
-                     pass
-                else:
-                     self.bomb_ally_respawn_time = now + 120.0
+
+        def process_bomb(side: str, region_key: str, template_name: str, threshold: int, carried_attr: str, last_seen_attr: str, respawn_attr: str, play_sound: bool = False):
+            if region_key not in self.regions:
+                if int(now) % 10 == 0:
+                    print(f"[DEBUG] '{region_key}' region not set, skipping {side} scan.")
+                return
+
+            matches = self.scanner.find_template(
+                self.regions[region_key],
+                template_name,
+                threshold=threshold,
+                return_positions=True,
+                max_results=3,
+            ) or []
+
+            carried = getattr(self, carried_attr)
+            respawn_time = getattr(self, respawn_attr)
+            last_seen = getattr(self, last_seen_attr)
+
+            if matches:
+                if not carried:
+                    print(f"[DEBUG] Bomb {side.upper()} detected (state change)")
+
+                setattr(self, last_seen_attr, now)
+                setattr(self, carried_attr, True)
+
+                timer_active = now < respawn_time
+                has_two_icons = self._has_multiple_bomb_icons(matches)
+
+                should_start_timer = False
+                if not carried:
+                    # Only start a new timer if the previous one is not already running.
+                    should_start_timer = not timer_active
+                elif not timer_active and has_two_icons:
+                    # Timer expired while the original bomb was still carried; a second icon means a new bomb spawned.
+                    should_start_timer = True
+
+                if should_start_timer:
+                    setattr(self, respawn_attr, now + 120.0)
+                    if play_sound:
+                        self._play_sound(SND_BOMB)
             else:
-                # Not seen. Check grace period.
-                if (now - self.bomb_ally_last_seen) > self.BOMB_GRACE_PERIOD:
-                    if self.bomb_ally_carried:
-                         print(f"[DEBUG] Bomb ALLY lost (grace period expired)")
-                    self.bomb_ally_carried = False
-        else:
-             # throttle warning
-             if int(now) % 10 == 0: print("[DEBUG] 'ally_roster' region not set, skipping ally scan.")
-            
-        # Scan Enemy
-        if "enemy_roster" in self.regions:
-            # Your logs show scores of ~65-72 for the real enemy bomb.
-            # Our threshold was 40, so it failed (65 > 40 * 3 is false, wait...)
-            # The scanner logic is: avg_diff < (threshold * 3).
-            # If log says Diff: 65, that IS the avg_diff?
-            # NO. The scanner log says: "Diff: 65.12". 
-            # The scanner check is: `if avg_diff < (threshold * 3)`
-            # So if threshold is 40, Limit = 120.
-            # 65 < 120. So it SHOULD have detected it?
-            # Wait, let's look at scanner code again.
-            # `if avg_diff < (threshold * 3)`
-            # You saw the log "Potential... Diff: 65".
-            # That means it WAS detected as a candidate?
-            # Ah, the log "Potential" prints whenever Diff < 80.
-            # So if Diff is 65, and Threshold is 40 (Limit=120), it passes.
-            # BUT you said "detection stopped working".
-            # Maybe I am misinterpreting the unit of 'threshold' passed vs used.
-            # In Scanner: `threshold` passed is `40`. Comparison is `threshold * 3` -> `120`.
-            # So 65 should pass easily.
-            # Why did it fail?
-            # Maybe the *per pixel* check failed?
-            # `if checked_pixels > 5 and (total_diff / checked_pixels) > (threshold * 3)`
-            # That aborts if Avg > 120.
-            # Avg is 65. So it shouldn't abort.
-            #
-            # Let's look at the logs again.
-            # You see "Potential ... Diff: 65".
-            # That log happens at the End.
-            # If you saw that log, then `find_template` returned True!
-            # Because:
-            # if avg_diff < (threshold * 3): return True
-            # So if you saw "Potential", the function DID return True.
-            # So why did the UI not update?
-            # Because `self.bomb_enemy_carried` was already True?
-            # The UI only plays sound/resets timer if the state CHANGES.
-            # If the bomb is held for > 120s, the timer might be stuck?
-            #
-            # Wait, for the ALLY bomb, you saw NO logs.
-            # That means the Diff was > 80.
-            # So the Ally bomb is matching very poorly (>80).
-            # We need to increase the threshold significantly for Ally.
-            # Let's set it to 75? (Limit = 225).
-            
-            # For Enemy, you had correct detection but maybe issues with "dark background".
-            # Max diff in your logs was 73.35.
-            # False positives were seen around 99-105.
-            # Limit 25 -> 75 is too tight for 73.
-            # Limit 30 -> 90. 73 < 90 (Pass). 99 > 90 (Fail). Perfect.
-            has_bomb = self.scanner.find_template(self.regions["enemy_roster"], "bomb_enemy", threshold=30)
-            
-            if has_bomb:
-                if not self.bomb_enemy_carried:
-                     print(f"[DEBUG] Bomb ENEMY detected (State Change)!")
-                self.bomb_enemy_last_seen = now
-                self.bomb_enemy_carried = True
-                
-                # Logic: Maintain Timer
-                # "When the bomb is detected, start the timer and display it."
-                # "Do not refresh the timer in case the program loses the bomb and finds it again within those two minutes"
-                # "When the two minutes are over... start the timer again"
-                
-                # Check if we have an active timer that is valid (in future)
-                if now < self.bomb_respawn_time:
-                    # Timer is running. Do NOT refresh it.
-                    pass
-                else:
-                    # No Active Timer (or Expired). Start Clean 2 Minute Timer.
-                    # This covers:
-                    # 1. First pickup.
-                    # 2. Re-pickup after timer expiration.
-                    print(f"[DEBUG] Enemy Bomb pickup confirmed (new timer/sound)")
-                    self._play_sound(SND_BOMB)
-                    self.bomb_respawn_time = now + 120.0
-            else:
-                # Not seen
-                if (now - self.bomb_enemy_last_seen) > self.BOMB_GRACE_PERIOD:
-                    if self.bomb_enemy_carried:
-                         print(f"[DEBUG] Bomb ENEMY lost (grace period expired)")
-                    self.bomb_enemy_carried = False
-        else:
-             if int(now) % 10 == 0: print("[DEBUG] 'enemy_roster' region not set, skipping enemy scan.")
+                if (now - last_seen) > self.BOMB_GRACE_PERIOD:
+                    if carried:
+                        print(f"[DEBUG] Bomb {side.upper()} lost (grace period expired)")
+                    setattr(self, carried_attr, False)
+
+        process_bomb("ally", "ally_roster", "bomb_ally", 50, "bomb_ally_carried", "bomb_ally_last_seen", "bomb_ally_respawn_time", False)
+        process_bomb("enemy", "enemy_roster", "bomb_enemy", 30, "bomb_enemy_carried", "bomb_enemy_last_seen", "bomb_respawn_time", True)
 
     def _scan_capture(self):
         # Runs in Thread

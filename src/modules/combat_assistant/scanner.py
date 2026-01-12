@@ -38,11 +38,22 @@ class ScreenScanner:
             print(f"[DEBUG] Failed to load template '{name}': {e}")
             pass
 
-    def find_template(self, region: Tuple[int, int, int, int], template_name: str, threshold=50) -> bool:
+    def find_template(
+        self,
+        region: Tuple[int, int, int, int],
+        template_name: str,
+        threshold=50,
+        *,
+        return_positions: bool = False,
+        max_results: int = 1,
+    ):
         """
         Pure Python Template Matching with Multi-Scale support.
+
         region: (left, top, width, height)
         threshold: Max average pixel difference (0-255). Lower is stricter.
+        return_positions: when True, collect up to `max_results` absolute (x, y) matches instead of
+            short-circuiting on the first hit.
         """
         if not HAS_MSS or template_name not in self.templates:
             if not HAS_MSS: print("[DEBUG] MSS not available")
@@ -50,6 +61,7 @@ class ScreenScanner:
             return False
 
         orig_template = self.templates[template_name]
+        found_positions = [] if return_positions else None
         
         # Check region vs template sizes for 1.0x
         # If region is smaller than even smallest scale, fail
@@ -164,15 +176,20 @@ class ScreenScanner:
                                 if avg_diff < limit:
                                     # Match Found!
                                     # print(f"[DEBUG] Found '{template_name}' at ({x},{y}) with diff {avg_diff:.2f}")
-                                    return True
+                                    if return_positions:
+                                        found_positions.append((monitor["left"] + x, monitor["top"] + y))
+                                        if len(found_positions) >= max_results:
+                                            return found_positions
+                                    else:
+                                        return True
                 
-                # If we get here, no match found
+                # If we get here, no match found or not enough matches collected
                 # print(f"[DEBUG] Scan '{template_name}' failed. Best Diff: {best_diff:.2f}")
-                return False
+                return found_positions if return_positions else False
             except Exception as e:
                 self.last_error = f"Template Error: {e}"
                 print(f"[DEBUG] Exception in find_template: {e}")
-                return False
+                return [] if return_positions else False
 
     def get_pixel_color(self, x: int, y: int) -> Tuple[int, int, int]:
         """Returns (R, G, B)"""
