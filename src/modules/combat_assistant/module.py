@@ -12,7 +12,14 @@ from typing import List, Optional, Tuple, Dict
 
 from ...config import AppConfig
 from ..base import BaseModule
-from ..combat_analysis.parser import AURA_APPLY_RE, AURA_CANCEL_RE, GAME_END_RE, DAMAGE_HEAL_RE, _strip_id
+from ..combat_analysis.parser import (
+    AURA_APPLY_RE,
+    AURA_CANCEL_RE,
+    GAME_END_RE,
+    SESSION_START_RE,
+    DAMAGE_HEAL_RE,
+    _strip_id,
+)
 from .log_reader import LogTailer
 from .overlay import OverlayWindow, CalibrationOverlay
 from .scanner import ScreenScanner
@@ -344,55 +351,40 @@ class CombatAssistantModule(BaseModule):
 
         try:
             path = self.tailer.current_file
-            found_start = False
-            found_end = False
             is_conquest = False
-            start_time = 0.0
 
-            # Read file efficiently in chunks from end
-            chunk_size = 8192
+            # Read a tail chunk (5 MB) to find the most recent boundary event.
             file_size = os.path.getsize(path)
-            
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                # Read a larger chunk to ensure we catch 'Start gameplay' even in long matches.
-                # 5MB should cover hours of gameplay typically.
-                seek_pos = max(0, file_size - 5 * 1024 * 1024) 
+                seek_pos = max(0, file_size - 5 * 1024 * 1024)
                 f.seek(seek_pos)
                 lines = f.readlines()
-                
-                # Iterate backwards
+
                 for line in reversed(lines):
-                    # Check for End
-                    if not found_end and not found_start:
-                        if "Session finished" in line or "Quit application" in line: # GAME_END_RE equivalent
-                             found_end = True
-                             break # Match finished, we are idle
-                    
-                    # Check for Start
-                    if not found_start:
-                        if "Start gameplay" in line:
-                            found_start = True
-                            if "'ClanShip'" in line:
-                                is_conquest = True
-                            
-                            # We found start WITHOUT finding an End after it (since we search backwards).
-                            # So game is active.
-                            break
-                            
-            if found_start and not found_end:
-                 print("[DEBUG] Active match found in history!")
-                 self.match_active_signal = True
-                 self.match_is_conquest = is_conquest
-                 
-                 # Force visibility initially when we detect an active match
-                 # This ensures the overlay appears immediately upon attaching to a running game
-                 self.last_damage_time = time.time()
-                 
-                 self._update_visibility_logic()
-                 
-                 # Note: We cannot easily recover exact timers (bomb spawn times) without parsing timestamps 
-                 # which complicates things. 
-                 # But at least the overlay will show up.
+                    # First boundary wins because we traverse from latest to oldest.
+                    if (
+                        GAME_END_RE.search(line)
+                        or "Gameplay finished" in line
+                        or "Session finished" in line
+                        or "Quit application" in line
+                    ):
+                        self.match_active_signal = False
+                        self.match_is_conquest = False
+                        self._update_visibility_logic()
+                        return
+
+                    m_start = SESSION_START_RE.search(line)
+                    if m_start or "Start gameplay" in line:
+                        # Infer conquest from mode or explicit ClanShip marker.
+                        mode = m_start.group("mode") if m_start else ""
+                        is_conquest = "'ClanShip'" in line or mode == "ClanShip"
+
+                        print("[DEBUG] Active match found in history!")
+                        self.match_active_signal = True
+                        self.match_is_conquest = is_conquest
+                        self.last_damage_time = time.time()
+                        self._update_visibility_logic()
+                        return
         except Exception as e:
             print(f"Error checking log history: {e}")
 
@@ -989,6 +981,7 @@ class CombatAssistantModule(BaseModule):
         self.bomb_enemy_label.pack_forget()
 
         conquest_visible = False
+        content_visible = False
         
         # 1. Agony
         if self.enable_agony_var.get() and self.match_active_signal:
@@ -998,6 +991,7 @@ class CombatAssistantModule(BaseModule):
             if not extras:
                 # Single (Original) Mode
                 self.agony_label.pack(anchor="w")
+                content_visible = True
                 if now < self.agony_active_until:
                     # Active -> Yellow
                     self.agony_label.config(text=f"Agony buff: ACTIVE {int(self.agony_active_until - now)}s", fg="#ffff33")
@@ -1010,6 +1004,7 @@ class CombatAssistantModule(BaseModule):
             else:
                 # Multi User Mode
                 self.agony_label.pack(anchor="w")
+                content_visible = True
                 self.agony_label.config(text="Agony buff:", fg="white")
                 
                 # Gather items
@@ -1033,6 +1028,7 @@ class CombatAssistantModule(BaseModule):
                 for i, (name, active, cd) in enumerate(items):
                     lbl = self.agony_multi_labels[i]
                     lbl.pack(anchor="w", padx=(20, 0))
+                    content_visible = True
                     
                     if now < active:
                         # Active -> Yellow
@@ -1051,11 +1047,12 @@ class CombatAssistantModule(BaseModule):
         if self.enable_torp_var.get() and self.match_is_conquest:
             conquest_visible = True
             self.torp_label.pack(anchor="w")
+            content_visible = True
             if now < self.torp_next_wave:
-                 rem = int(self.torp_next_wave - now)
-                 self.torp_label.config(text=f"Torpedos: {rem}s", fg="#ff8800")
+                rem = int(self.torp_next_wave - now)
+                self.torp_label.config(text=f"Torpedos: {rem}s", fg="#ff8800")
             else:
-                 self.torp_label.config(text="Torpedos: READY", fg="#33ff33")
+                self.torp_label.config(text="Torpedos: READY", fg="#33ff33")
 
         # 3. Bombs
         # Only show if enabled AND in Conquest mode
@@ -1063,6 +1060,7 @@ class CombatAssistantModule(BaseModule):
             conquest_visible = True
             self.bomb_ally_label.pack(anchor="w")
             self.bomb_enemy_label.pack(anchor="w")
+            content_visible = True
             
             # Ally Bomb
             # Logic:
@@ -1072,7 +1070,7 @@ class CombatAssistantModule(BaseModule):
                 rem = int(self.bomb_ally_respawn_time - now)
                 self.bomb_ally_label.config(text=f"Allied Bomb: {rem}s", fg="#ff3333")
             else:
-                 self.bomb_ally_label.config(text="Allied Bomb: READY", fg="#33ff33") # Green
+                self.bomb_ally_label.config(text="Allied Bomb: READY", fg="#33ff33") # Green
 
             # Enemy Bomb
             # Logic:
@@ -1083,6 +1081,13 @@ class CombatAssistantModule(BaseModule):
                 self.bomb_enemy_label.config(text=f"Enemy Bomb: {rem}s", fg="#ff3333")
             else:
                 self.bomb_enemy_label.config(text="Enemy Bomb: READY", fg="#33ff33")
+
+        # If nothing is visible, hide immediately to avoid an empty black box lingering after matches
+        if not content_visible:
+            if self._is_visible and self.overlay:
+                self.overlay.hide()
+                self._is_visible = False
+            return
 
         self._layout_overlay_frames(multi_mode, conquest_visible)
 

@@ -6,3 +6,4 @@ dist/
 src/modules/combat_assistant/settings.json
 src/config.json
 *.pkl
+combat.log
