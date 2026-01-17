@@ -99,6 +99,7 @@ class CombatModule(BaseModule):
         self._initial_popup_shown = False
         self._initial_popup_pending = False
         self._initial_popup: Optional[tk.Toplevel] = None
+        self.settings_popup: Optional[tk.Toplevel] = None
         
         # Persistent color cache for players
         self.player_color_cache: Dict[str, str] = {}
@@ -148,10 +149,17 @@ class CombatModule(BaseModule):
         }
 
     def _open_settings_dialog(self):
+        if self.settings_popup and tk.Toplevel.winfo_exists(self.settings_popup):
+            self.settings_popup.lift()
+            self.settings_popup.focus_force()
+            return
+
         win = tk.Toplevel(self.app)
+        self.settings_popup = win
         win.title("Combat Analysis Settings")
         win.configure(bg=self.colors["bg"])
         win.resizable(False, False)
+        win.attributes("-topmost", True)
         
         # Center the window
         w, h = 500, 300
@@ -371,6 +379,7 @@ class CombatModule(BaseModule):
         top.title(f"Debug Lines - {fight.file_path.name}")
         top.geometry("900x600")
         top.configure(bg=self.colors["bg"])
+        top.attributes("-topmost", True)
         self._center_window(top, 900, 600)
 
         header = ttk.Frame(top, padding=8, style="Panel.TFrame")
@@ -2490,6 +2499,7 @@ class CombatModule(BaseModule):
         self.game_mode_popup = tk.Toplevel(self.frame)
         self.game_mode_popup.overrideredirect(True)
         self.game_mode_popup.configure(bg=self.colors["border"])
+        self.game_mode_popup.attributes("-topmost", True)
         
         # Position it
         try:
@@ -2840,6 +2850,7 @@ class CombatModule(BaseModule):
         top = tk.Toplevel(self.frame)
         top.title(f"{player} Breakdown")
         top.transient(self.frame)
+        top.attributes("-topmost", True)
         top.grab_set()
         self._center_window(top, width=900, height=720)
         top.configure(bg=self.colors["bg"])
@@ -3437,6 +3448,7 @@ class CombatModule(BaseModule):
         win.configure(bg=self.colors["bg"])
         win.transient(self.app)
         win.lift(self.app)
+        win.attributes("-topmost", True)
 
         def _on_close():
             self._display_names_window = None
@@ -3706,6 +3718,7 @@ class CombatModule(BaseModule):
 
         def prompt_conflict_resolution(conflicts: Dict[str, Tuple[str, str]]) -> Optional[Dict[str, str]]:
             dialog = tk.Toplevel(win)
+            dialog.attributes("-topmost", True)
             dialog.title("Resolve Conflicts")
             dialog.configure(bg=self.colors["bg"])
             self._center_window(dialog, width=700, height=420)

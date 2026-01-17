@@ -924,6 +924,14 @@ class CombatAssistantModule(BaseModule):
         self._update_after_id = self.app.after(100, self._schedule_update)
 
     def _update_visibility_logic(self):
+        # Force show if editing
+        if self.overlay_editing:
+             if self.overlay:
+                 if not self._is_visible:
+                     self.overlay.show()
+                     self._is_visible = True
+             return
+
         # Master Switch Check
         if not self.master_overlay_enabled.get():
              if self._is_visible:

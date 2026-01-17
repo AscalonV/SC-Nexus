@@ -253,6 +253,7 @@ class SelfTorpModule(BaseModule):
 
         self._settings_win = tk.Toplevel(self.app)
         self._settings_win.title("Self-Torp Settings")
+        self._settings_win.attributes("-topmost", True)
         self._settings_win.configure(bg=self.app.colors.get("bg", "#0b1224"))
         self._settings_win.resizable(False, False)
 
@@ -319,14 +320,22 @@ class SelfTorpModule(BaseModule):
                 self.enable()
 
             self._refresh_launchpad()
-            self._settings_win.destroy()
+            if self._settings_win:
+                self._settings_win.destroy()
             self._settings_win = None
 
         ttk.Button(btn_row, text="Save", command=save, style="Accent.TButton").pack(side=tk.RIGHT, padx=(8, 0))
-        ttk.Button(btn_row, text="Cancel", command=self._settings_win.destroy).pack(side=tk.RIGHT)
+        
+        def cancel():
+            if self._settings_win:
+                self._settings_win.destroy()
+            self._settings_win = None
+
+        ttk.Button(btn_row, text="Cancel", command=cancel).pack(side=tk.RIGHT)
 
     def _capture_hotkey(self, target_var: tk.StringVar):
         cap = tk.Toplevel(self.app)
+        cap.attributes("-topmost", True)
         cap.title("Press hotkey")
         cap.configure(bg=self.app.colors.get("bg", "#0b1224"))
         cap.resizable(False, False)
