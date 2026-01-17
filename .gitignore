@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 build/
+dist/
 .vscode/
 src/modules/combat_assistant/settings.json
 src/config.json
