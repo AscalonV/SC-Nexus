@@ -10,7 +10,7 @@ import ctypes
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
-from ...config import AppConfig
+from ...config import AppConfig, USER_DATA_DIR
 from ..base import BaseModule
 from ..combat_analysis.parser import (
     AURA_APPLY_RE,
@@ -41,7 +41,7 @@ class CombatAssistantModule(BaseModule):
         self.frame: Optional[ttk.Frame] = None
         self._scan_after_id = None
         self._update_after_id = None
-        self.settings_file = Path(__file__).parent / "settings.json"
+        self.settings_file = USER_DATA_DIR / "combat_assistant_settings.json"
         
         # --- State ---
         self.username_var = tk.StringVar(value=config.username)

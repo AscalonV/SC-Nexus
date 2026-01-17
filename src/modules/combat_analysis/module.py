@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from ...config import AppConfig
+from ...config import AppConfig, USER_DATA_DIR
 from ..base import BaseModule
 from . import parser
 from .display_names import DisplayNameManager
@@ -92,7 +92,7 @@ class CombatModule(BaseModule):
         self.pie_details_tree_heal: Optional[ttk.Treeview] = None
         self.pie_details_tree_recv: Optional[ttk.Treeview] = None
         self.pie_details_tree_heal_recv: Optional[ttk.Treeview] = None
-        self.display_name_manager = DisplayNameManager(Path(__file__).parent)
+        self.display_name_manager = DisplayNameManager(USER_DATA_DIR)
         self.pie_sources_section: Optional[ttk.Frame] = None
         self.pie_sources_toggle_btn: Optional[ttk.Button] = None
         self.pie_sources_collapsed = True

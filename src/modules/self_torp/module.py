@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from ...config import AppConfig
+from ...config import AppConfig, USER_DATA_DIR
 from ..base import BaseModule
 
 # Windows constants
@@ -166,7 +166,7 @@ class SelfTorpModule(BaseModule):
         self.config = config
         self.frame: Optional[ttk.Frame] = None
 
-        self.settings_path = Path(__file__).with_name("self_torp_settings.json")
+        self.settings_path = USER_DATA_DIR / "self_torp_settings.json"
         self.hotkey_text = "Ctrl+Alt+T"
         self.first_key = "1"
         self.burst_key = "2"
