@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['SC Nexus.pyw'],
+    ['SC Nexus.py'],
     pathex=[],
     binaries=[],
     datas=[('src', 'src')],
