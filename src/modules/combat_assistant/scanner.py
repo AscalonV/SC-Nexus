@@ -127,20 +127,25 @@ class ScreenScanner:
                     # Scan Screen for this Scale
                     # Optimization: Step size 2 for better precision
                     for y in range(0, sh - th, 2):
+                        # Yield to main thread every few rows to prevent UI freeze
+                        if y % 20 == 0:
+                            time.sleep(0.001)
+
                         for x in range(0, sw - tw, 2):
                             if use_anchor:
                                 sp = screen_pixels[x+cx, y+cy]
-                                if abs(sp[0]-cr) + abs(sp[1]-cg) + abs(sp[2]-cb) > (threshold * 3):
+                                # Relaxed anchor check (threshold * 5) to prevent skipping valid matches due to single-pixel noise
+                                if abs(sp[0]-cr) + abs(sp[1]-cg) + abs(sp[2]-cb) > (threshold * 5):
                                     continue
                                 
                             total_diff = 0
                             checked_pixels = 0
                             
-                            # Check grid
+                            # Check grid - NOW CHECKING EVERY PIXEL (Step 1) for maximum reliability
                             abort = False
                             
-                            for py in range(0, th, 2):
-                                for px in range(0, tw, 2):
+                            for py in range(0, th, 1):
+                                for px in range(0, tw, 1):
                                     t_pix = template_pixels[px, py]
                                     
                                     # CHECK 1: Alpha (Transparency)
@@ -148,16 +153,18 @@ class ScreenScanner:
                                     if t_pix[3] < 200: continue
 
                                     # CHECK 2: Brightness (Ignore Dark Backgrounds)
-                                    # If template pixel is very dark (sum RGB < 100), skip it.
+                                    # If template pixel is very dark (sum RGB < 50), skip it.
                                     # This prevents matching the black 'empty' space of the icon against dark space backgrounds.
-                                    if (t_pix[0] + t_pix[1] + t_pix[2]) < 100: continue
+                                    if (t_pix[0] + t_pix[1] + t_pix[2]) < 50: continue
                                     
                                     s_pix = screen_pixels[x+px, y+py]
+                                    # Calculate difference across 3 channels (RGB)
                                     pixel_diff = abs(s_pix[0]-t_pix[0]) + abs(s_pix[1]-t_pix[1]) + abs(s_pix[2]-t_pix[2])
                                     total_diff += pixel_diff
                                     checked_pixels += 1
                                     
                                     # Abort if bad match
+                                    # threshold * 3 because we are summing differences of 3 Channels (R+G+B)
                                     if checked_pixels > 5 and (total_diff / checked_pixels) > (threshold * 3):
                                         abort = True
                                         break
@@ -170,8 +177,9 @@ class ScreenScanner:
                                     best_diff = avg_diff
 
                                 limit = threshold * 3
-                                if avg_diff < limit or avg_diff < 200:
-                                    print(f"[DEBUG] Potential '{template_name}' at ({x},{y}) - Diff: {avg_diff:.2f} (Pixels: {checked_pixels}) Limit: {limit}")
+                                # Only print near misses or debugging (disabled for production spam reduction)
+                                # if avg_diff < limit or avg_diff < 200:
+                                    # print(f"[DEBUG] Potential '{template_name}' at ({x},{y}) - Diff: {avg_diff:.2f} (Pixels: {checked_pixels}) Limit: {limit}")
 
                                 if avg_diff < limit:
                                     # Match Found!

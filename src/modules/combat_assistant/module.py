@@ -119,8 +119,11 @@ class CombatAssistantModule(BaseModule):
         
         # Assets
         self.assets_path = Path(__file__).parent / "assets"
-        self.scanner.load_template("bomb_ally", self.assets_path / "Allied bomb logo.png")
-        self.scanner.load_template("bomb_enemy", self.assets_path / "Enemy bomb logo.png")
+        # Load assets in background
+        def _load_assets():
+            self.scanner.load_template("bomb_ally", self.assets_path / "Allied bomb logo.png")
+            self.scanner.load_template("bomb_enemy", self.assets_path / "Enemy bomb logo.png")
+        threading.Thread(target=_load_assets, daemon=True).start()
 
         # Focus State Tracking
         self._last_focus_state = None  # None, "game", or "other"
@@ -472,6 +475,7 @@ class CombatAssistantModule(BaseModule):
     def on_show(self):
         if self.tailer:
             self.tailer.update_root(self.config.logs_path)
+            self.tailer.start()
 
     def on_hide(self):
         if self._scan_after_id:
@@ -484,6 +488,9 @@ class CombatAssistantModule(BaseModule):
         
         self._save_settings()
         
+        if self.tailer:
+            self.tailer.stop()
+
         if self.overlay:
             self.overlay.destroy()
             self.overlay = None
@@ -674,21 +681,25 @@ class CombatAssistantModule(BaseModule):
         if not self.frame: return
         
         if self._scan_thread is None or not self._scan_thread.is_alive():
-            self._scan_thread = threading.Thread(target=self._run_scan_thread, daemon=True)
+            # Capture variables in main thread (Tcl is not thread safe)
+            bomb_on = self.enable_bomb_var.get()
+            capture_on = self.enable_capture_var.get()
+            
+            self._scan_thread = threading.Thread(target=self._run_scan_thread, args=(bomb_on, capture_on), daemon=True)
             self._scan_thread.start()
             
         # Re-schedule check for thread completion or next run
         self._scan_after_id = self.app.after(500, self._schedule_scan)
 
-    def _run_scan_thread(self):
+    def _run_scan_thread(self, bomb_on, capture_on):
         # Heavy lifting here
         try:
             with self.scan_lock:
                  # Logic for features
-                 if self.enable_bomb_var.get():
+                 if bomb_on:
                     self._scan_bombs()
                 
-                 if self.enable_capture_var.get():
+                 if capture_on:
                      self._scan_capture()
                  else:
                      # Even if capture logic is disabled, if we have points set, we might want to update the debug labels 
@@ -792,7 +803,7 @@ class CombatAssistantModule(BaseModule):
                     setattr(self, carried_attr, False)
 
         process_bomb("ally", "ally_roster", "bomb_ally", 50, "bomb_ally_carried", "bomb_ally_last_seen", "bomb_ally_respawn_time", False)
-        process_bomb("enemy", "enemy_roster", "bomb_enemy", 30, "bomb_enemy_carried", "bomb_enemy_last_seen", "bomb_respawn_time", True)
+        process_bomb("enemy", "enemy_roster", "bomb_enemy", 33, "bomb_enemy_carried", "bomb_enemy_last_seen", "bomb_respawn_time", True)
 
     def _scan_capture(self):
         # Runs in Thread

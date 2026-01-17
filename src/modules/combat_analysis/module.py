@@ -123,7 +123,10 @@ class CombatModule(BaseModule):
         self._theme_ready = False
         self._cancel_loading = False
         self._current_load_id = 0
-        self._load_fight_cache()
+        
+        # Load cache in background to speed up startup
+        threading.Thread(target=self._load_fight_cache, daemon=True).start()
+        
         self.fight_box: Optional[ttk.Combobox] = None
         self._app_visibility_bound = False
         self._loading_overlay: Optional[ttk.Frame] = None
@@ -504,22 +507,33 @@ class CombatModule(BaseModule):
                 self._update_log_scope_ui()
                 return
         else:
-            root = Path(self.logs_path_var.get())
-            if not root.exists():
-                messagebox.showwarning("Missing path", f"Path not found: {root}")
-                return
-            logs = parser.find_combat_logs(root)
+            # We defer the finding of logs to the background thread to avoid freezing UI
+            logs = None
 
         self._set_busy(True, "Loading fights...")
         self._cancel_loading = False
         self._current_load_id += 1
         load_id = self._current_load_id
+        
+        # Capture current logs path from UI var safely
+        current_logs_path_str = self.logs_path_var.get()
 
         def worker():
             import time
             try:
                 if self._cancel_loading or self._current_load_id != load_id: return
-                selected_logs = list(logs)
+                
+                # If we need to find logs, do it here in the thread
+                if logs_override:
+                    selected_logs = list(logs_override)
+                else:
+                    root = Path(current_logs_path_str)
+                    if not root.exists():
+                        self.frame.after(0, lambda: messagebox.showwarning("Missing path", f"Path not found: {root}"))
+                        self.frame.after(0, lambda: self._set_busy(False, "Ready"))
+                        return
+                    selected_logs = parser.find_combat_logs(root)
+
                 total = len(selected_logs) or 1
                 self.frame.after(0, lambda: self._init_progress(total))
 

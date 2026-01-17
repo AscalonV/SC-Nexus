@@ -7,6 +7,7 @@ from .modules.base import BaseModule
 from .modules.combat_analysis.module import CombatModule
 from .modules.combat_assistant.module import CombatAssistantModule
 from .modules.player_stats.module import PlayerStatsModule
+from .modules.self_torp.module import SelfTorpModule
 
 
 class App(tk.Tk):
@@ -36,6 +37,7 @@ class App(tk.Tk):
         self.modules: Dict[str, BaseModule] = {
             "Combat Analyzer": CombatModule(self, self.config),
             "Combat Assistant": CombatAssistantModule(self, self.config),
+            "Self-Torp": SelfTorpModule(self, self.config),
             # "Player Stats": PlayerStatsModule(self, self.config),
         }
 
@@ -50,6 +52,17 @@ class App(tk.Tk):
         self.content.pack(fill=tk.BOTH, expand=True)
 
         self._build_welcome()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        """Cleanup modules before exiting."""
+        for module in self.modules.values():
+            try:
+                module.on_exit()
+            except Exception:
+                pass
+        self.destroy()
 
     def _build_welcome(self) -> None:
         if self.current_module:
@@ -77,24 +90,59 @@ class App(tk.Tk):
             tile_border.grid(row=row, column=col, padx=20, pady=20)
 
             # Inner Content
-            tile = ttk.Frame(tile_border, style="Tile.TFrame", padding=20, width=280, height=180)
+            tile = ttk.Frame(tile_border, style="Tile.TFrame", padding=20, width=280, height=200)
             tile.pack_propagate(False)
             tile.pack(fill=tk.BOTH, expand=True)
 
-            # Content Widgets
-            l_title = ttk.Label(tile, text=name, font=("Segoe UI", 16, "bold"), style="TileTitle.TLabel")
-            l_title.pack(anchor=tk.CENTER, pady=(10, 10))
-            
+            status_text = ""
+            status_fn = getattr(module, "tile_status", None)
+            if callable(status_fn):
+                try:
+                    status_text = status_fn()
+                except Exception:
+                    status_text = ""
+            elif isinstance(status_fn, str):
+                status_text = status_fn
+
+            inline_status = bool(status_text) and len(status_text) <= 8
+
+            # Header with title (optional inline status)
+            header = ttk.Frame(tile, style="Tile.TFrame")
+            header.pack(fill=tk.X)
+
+            title_text = f"{name} ({status_text})" if inline_status else name
+            l_title = ttk.Label(header, text=title_text, font=("Segoe UI", 16, "bold"), style="TileTitle.TLabel")
+            l_title.pack(side=tk.LEFT, anchor=tk.W, pady=(10, 10))
+
             desc = getattr(module, "description", "")
             l_desc = None
             if desc:
                 l_desc = ttk.Label(tile, text=desc, wraplength=240, justify=tk.CENTER, style="TileDesc.TLabel")
                 l_desc.pack(anchor=tk.CENTER)
 
+            # Footer with optional settings cog aligned bottom-right
+            footer = ttk.Frame(tile, style="Tile.TFrame")
+            footer.pack(side=tk.BOTTOM, fill=tk.X, padx=(0, 4), pady=(8, 4))
+            if callable(getattr(module, "open_settings", None)):
+                ttk.Button(
+                    footer,
+                    text="⚙",
+                    width=3,
+                    command=lambda m=module: self._open_module_settings(m),
+                    style="TButton"
+                ).pack(side=tk.RIGHT)
+
             # Hover Effects & Click Binding
-            widgets = [tile, l_title]
+            l_status = None
+            if status_text and not inline_status:
+                l_status = ttk.Label(tile, text=status_text, justify=tk.LEFT, style="TileDesc.TLabel")
+                l_status.pack(anchor=tk.W, pady=(0, 2))
+
+            widgets = [tile, header, footer, l_title]
             if l_desc:
                 widgets.append(l_desc)
+            if l_status:
+                widgets.append(l_status)
 
             def on_enter(e, w_list=widgets, border_frame=tile_border):
                 border_frame.configure(style="TileBorderHover.TFrame")
@@ -117,7 +165,13 @@ class App(tk.Tk):
                         w.configure(style="Tile.TFrame")
 
             def on_click(e, m=module):
-                self.show_module(m)
+                handled = False
+                try:
+                    handled = bool(m.on_tile_click())
+                except Exception:
+                    handled = False
+                if not handled:
+                    self.show_module(m)
 
             for w in widgets:
                 w.bind("<Enter>", on_enter)
@@ -193,6 +247,14 @@ class App(tk.Tk):
         ttk.Button(path_frame, text="...", width=3, command=browse_path, style="TButton").pack(side=tk.LEFT, padx=(5,0))
         
         ttk.Button(container, text="Close", command=win.destroy, style="Accent.TButton").grid(row=2, column=1, sticky="e", pady=20)
+
+    def _open_module_settings(self, module: BaseModule):
+        handler = getattr(module, "open_settings", None)
+        if callable(handler):
+            try:
+                handler()
+            except Exception:
+                pass
 
     def show_module(self, module: BaseModule) -> None:
         if self.current_module and self.current_module != module:

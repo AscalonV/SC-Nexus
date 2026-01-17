@@ -18,3 +18,16 @@ class BaseModule(ABC):
     def on_hide(self):
         """Called when navagating away from the module."""
         pass
+
+    def on_exit(self):
+        """Called when the application is closing."""
+        pass
+
+    # Optional launchpad hooks
+    def on_tile_click(self) -> bool:
+        """Handle launchpad tile clicks. Return True to prevent navigation."""
+        return False
+
+    def tile_status(self) -> str:
+        """Optional short status line for the launchpad tile."""
+        return ""
