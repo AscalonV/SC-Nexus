@@ -9,3 +9,4 @@ src/config.json
 *.pkl
 combat.log
 src/modules/self_torp/self_torp_settings.json
+*.tmp

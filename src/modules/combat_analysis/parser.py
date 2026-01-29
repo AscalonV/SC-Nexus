@@ -763,10 +763,22 @@ def build_fights_stream(
     return results
 
 
-def parse_file_quick(log_file: Path) -> List[Fight]:
-    """Parse a single log file with streaming and no callbacks (suitable for multiprocessing)."""
+def parse_file_quick(log_file: Path, progress_file=None) -> List[Fight]:
+    """Parse a single log file with streaming. If progress_file is provided, writes current progress there."""
     total_lines = count_lines_fast(log_file)
-    return build_fights_stream(log_file, total_lines=total_lines, progress_cb=None, progress_every=0)
+    
+    cb = None
+    if progress_file:
+        def _cb(current, total):
+            try:
+                # Write to file atomically-ish
+                with open(progress_file, "w") as f:
+                    f.write(f"{current},{total}")
+            except Exception:
+                pass
+        cb = _cb
+        
+    return build_fights_stream(log_file, total_lines=total_lines, progress_cb=cb, progress_every=5000)
 
 
 def load_all_fights(root: Path, progress_cb=None) -> List[Fight]:

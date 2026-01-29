@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
+import multiprocessing
 import concurrent.futures
 import os
 import pickle
@@ -582,38 +583,85 @@ class CombatModule(BaseModule):
                     return
 
                 start_idx = progress_count
-                with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count() or 2) as pool:
-                    future_to_meta = {pool.submit(parser.parse_file_quick, log): (log, sig) for log, sig in to_parse}
-                    pending = set(future_to_meta.keys())
-                    completed_count = 0
-
-                    while pending:
-                        if self._cancel_loading or self._current_load_id != load_id:
-                            pool.shutdown(wait=False, cancel_futures=True)
-                            break
-                        
-                        # Wait briefly to allow cancellation checks
-                        done, _ = concurrent.futures.wait(pending, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED)
-                        
-                        for future in done:
-                            pending.remove(future)
-                            log_path, sig = future_to_meta[future]
-                            try:
-                                parsed = future.result()
-                                fights.extend(parsed)
-                                if sig:
-                                    self.fight_cache[str(log_path)] = (sig[0], sig[1], self.fight_cache_version, parsed)
-                            except Exception:
-                                pass
+                
+                # Use temp files for progress to avoid Manager() overhead/instability
+                import tempfile
+                temp_dir = tempfile.mkdtemp()
+                temp_dir_path = Path(temp_dir)
+                progress_files = {} # log_path -> temp_file_path
+                
+                try:
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count() or 2) as pool:
+                        # Prepare args
+                        future_to_meta = {}
+                        for log, sig in to_parse:
+                            p_file = temp_dir_path / f"prog_{hash(str(log))}.txt"
+                            progress_files[str(log)] = p_file
+                            future_to_meta[pool.submit(parser.parse_file_quick, log, str(p_file))] = (log, sig)
                             
-                            completed_count += 1
-                            current = start_idx + completed_count
-                            now = time.time()
-                            # Always update on the very last item, otherwise throttle
-                            if completed_count == len(future_to_meta) or (now - last_ui_update > 0.05):
-                                last_ui_update = now
-                                self.frame.after(0, lambda v=current, t=total, p=log_path: self._update_progress(v, t, p))
-                                self.frame.after(0, lambda: self._update_file_progress(1, 1))
+                        pending = set(future_to_meta.keys())
+                        completed_count = 0
+                        active_file_progress = {}
+
+                        while pending:
+                            if self._cancel_loading or self._current_load_id != load_id:
+                                pool.shutdown(wait=False, cancel_futures=True)
+                                break
+                            
+                            # Read progress files
+                            for l_path, p_file in progress_files.items():
+                                if p_file.exists():
+                                    try:
+                                        content = p_file.read_text().strip()
+                                        if content:
+                                            cur, tot = map(int, content.split(","))
+                                            active_file_progress[l_path] = (cur, tot)
+                                    except Exception:
+                                        pass
+                            
+                            # Update UI with the largest active file (closest to being the bottleneck)
+                            if active_file_progress:
+                                best_path = max(active_file_progress, key=lambda k: active_file_progress[k][1])
+                                cur, tot = active_file_progress[best_path]
+                                fname = Path(best_path).name
+                                self.frame.after(0, lambda c=cur, t=tot, n=fname: self._update_file_progress(c, t, n))
+
+                            # Wait briefly to allow cancellation checks
+                            done, _ = concurrent.futures.wait(pending, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED)
+                            
+                            for future in done:
+                                pending.remove(future)
+                                log_path, sig = future_to_meta[future]
+                                
+                                # Clean up stats
+                                s_path = str(log_path)
+                                if s_path in active_file_progress:
+                                    del active_file_progress[s_path]
+
+                                try:
+                                    parsed = future.result()
+                                    fights.extend(parsed)
+                                    if sig:
+                                        self.fight_cache[str(log_path)] = (sig[0], sig[1], self.fight_cache_version, parsed)
+                                except Exception:
+                                    pass
+                                
+                                completed_count += 1
+                                current = start_idx + completed_count
+                                now = time.time()
+                                # Always update on the very last item, otherwise throttle
+                                if completed_count == len(future_to_meta) or (now - last_ui_update > 0.05):
+                                    last_ui_update = now
+                                    self.frame.after(0, lambda v=current, t=total, p=log_path: self._update_progress(v, t, p))
+                                    # Only clear file progress if we just finished the one we were showing
+                                    if not active_file_progress:
+                                        self.frame.after(0, lambda: self._update_file_progress(1, 1))
+                finally:
+                    import shutil
+                    try:
+                        shutil.rmtree(temp_dir_path)
+                    except Exception:
+                        pass
 
                 # Ensure final 100% progress is shown
                 self.frame.after(0, lambda: self._update_progress(total, total, Path("Finishing...")))
@@ -721,10 +769,12 @@ class CombatModule(BaseModule):
         self.current_file_path = file_path
         self._overlay_sublabel_var.set(f"Current file: {file_path}")
 
-    def _update_file_progress(self, value: int, total: int) -> None:
-        # Just update debug text
-        path_display = self.current_file_path if self.current_file_path else ""
-        self._overlay_sublabel_var.set(f"Current file: {path_display} (done)")
+    def _update_file_progress(self, value: int, total: int, filename: str = "") -> None:
+        if filename:
+            self._overlay_sublabel_var.set(f"Scanning {filename}: {value}/{total} lines")
+        else:
+            path_display = self.current_file_path.name if self.current_file_path else ""
+            self._overlay_sublabel_var.set(f"Finished: {path_display}")
 
 
     def _build_pie_tab(self):
