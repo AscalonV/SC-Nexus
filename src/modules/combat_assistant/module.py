@@ -513,6 +513,10 @@ class CombatAssistantModule(BaseModule):
         
         # Check for damage activity to keep overlay alive
         for line in lines:
+            # Avoid Hangar activity triggering the overlay
+            if "Hangar" in line:
+                continue
+
             if DAMAGE_HEAL_RE.search(line):
                 self.last_damage_time = now
                 self._update_visibility_logic()

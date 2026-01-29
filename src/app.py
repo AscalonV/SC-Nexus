@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Dict
 
-from .config import AppConfig
+from .config import AppConfig, USER_DATA_DIR
 from .modules.base import BaseModule
 from .modules.combat_analysis.module import CombatModule
 from .modules.combat_assistant.module import CombatAssistantModule
@@ -398,10 +398,58 @@ class App(tk.Tk):
 def run_app() -> None:
     try:
         import ctypes
+        import sys
+        import subprocess
+        import json
+        
         # Reverting to System Aware (1).
         # Per-Monitor (2) causes the main window to be huge on low-DPI screens because Tkinter widgets don't auto-scale well.
         # We will handle Overlay positioning manually using SetWindowPos.
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
+
+        # Early check for Self-Torp admin requirement
+        st_settings_path = USER_DATA_DIR / "self_torp_settings.json"
+        
+        should_elevate = False
+        if st_settings_path.exists():
+            try:
+                with open(st_settings_path, "r") as f:
+                    data = json.load(f)
+                    
+                if data.get("enabled", False):
+                    if not ctypes.windll.shell32.IsUserAnAdmin():
+                        # MB_YESNO | MB_ICONQUESTION | MB_TOPMOST
+                        result = ctypes.windll.user32.MessageBoxW(
+                            None,
+                            "Self-Torp module is enabled but requires Administrator privileges.\n\nRestart SC Nexus as Administrator?",
+                            "Administrator Required",
+                            0x04 | 0x20 | 0x40000
+                        )
+                        
+                        if result == 6:  # IDYES
+                            should_elevate = True
+                        else:
+                            # User declined, disable the module to prevent re-prompting
+                            data["enabled"] = False
+                            with open(st_settings_path, "w") as fw:
+                                json.dump(data, fw, indent=2)
+            except Exception:
+                pass
+
+        if should_elevate:
+            try:
+                ctypes.windll.shell32.ShellExecuteW(
+                    None,
+                    "runas",
+                    sys.executable,
+                    subprocess.list2cmdline(sys.argv),
+                    None,
+                    1
+                )
+                return
+            except Exception:
+                pass
+
     except Exception:
         pass
 
