@@ -79,7 +79,7 @@ class CombatAssistantModule(BaseModule):
         # Bomb Stability
         self.bomb_ally_last_seen = 0.0
         self.bomb_enemy_last_seen = 0.0
-        self.BOMB_GRACE_PERIOD = 2.0
+        self.BOMB_GRACE_PERIOD = 3.0
 
         # Create Scan Lock
         self.scan_lock = threading.Lock()
@@ -383,7 +383,7 @@ class CombatAssistantModule(BaseModule):
                         mode = m_start.group("mode") if m_start else ""
                         is_conquest = "'ClanShip'" in line or mode == "ClanShip"
 
-                        print("[DEBUG] Active match found in history!")
+                        print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Active match found in history!")
                         self.match_active_signal = True
                         self.match_is_conquest = is_conquest
                         self.last_damage_time = time.time()
@@ -532,7 +532,7 @@ class CombatAssistantModule(BaseModule):
                 # Check for Conquest Mode (ClanShip)
                 if "'ClanShip'" in line:
                     self.match_is_conquest = True
-                    print("[DEBUG] Conquest Mode Detected (ClanShip)")
+                    print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Conquest Mode Detected (ClanShip)")
                 else:
                     self.match_is_conquest = False
                 
@@ -664,12 +664,13 @@ class CombatAssistantModule(BaseModule):
             
             # Print only on transition
             if self._last_focus_state != current_state:
+                ts = time.strftime('%H:%M:%S')
                 if current_state == "game":
-                    print(f"[DEBUG] Game window FOCUSED ({current_window})")
+                    print(f"[{ts}] [DEBUG] Game window FOCUSED ({current_window})")
                 elif current_state == "other":
-                     print(f"[DEBUG] Focus LOST. Current window: '{current_window}'")
+                     print(f"[{ts}] [DEBUG] Focus LOST. Current window: '{current_window}'")
                 elif current_state == "unknown":
-                     print(f"[DEBUG] Focus Unknown.")
+                     print(f"[{ts}] [DEBUG] Focus Unknown.")
                 
                 self._last_focus_state = current_state
                 
@@ -719,7 +720,7 @@ class CombatAssistantModule(BaseModule):
                                  debug_vals[name] = self.scanner.get_pixel_color(*self.points[name])
                          self.app.after(0, self._apply_debug_labels, debug_vals)
         except Exception as e:
-            print(f"[DEBUG] Error in scan thread: {e}")
+            print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Error in scan thread: {e}")
 
     def _update_capture_debug(self):
         # This runs on main thread, quick check of LAST known values?
@@ -763,7 +764,7 @@ class CombatAssistantModule(BaseModule):
         def process_bomb(side: str, region_key: str, template_name: str, threshold: int, carried_attr: str, last_seen_attr: str, respawn_attr: str, play_sound: bool = False):
             if region_key not in self.regions:
                 if int(now) % 10 == 0:
-                    print(f"[DEBUG] '{region_key}' region not set, skipping {side} scan.")
+                    print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] '{region_key}' region not set, skipping {side} scan.")
                 return
 
             matches = self.scanner.find_template(
@@ -780,7 +781,19 @@ class CombatAssistantModule(BaseModule):
 
             if matches:
                 if not carried:
-                    print(f"[DEBUG] Bomb {side.upper()} detected (state change)")
+                    try:
+                        # Log confidence scores properly if float (0-1) or legacy diff
+                        debug_str = []
+                        for m in matches:
+                            val = m[2]
+                            if val <= 1.0:
+                                debug_str.append(f"({m[0]}, {m[1]}) conf={val*100:.1f}%")
+                            else:
+                                debug_str.append(f"({m[0]}, {m[1]}) diff={val:.1f}")
+                        details = ", ".join(debug_str)
+                    except Exception:
+                        details = str(matches)
+                    print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Bomb {side.upper()} detected (state change). Matches: {details}")
 
                 setattr(self, last_seen_attr, now)
                 setattr(self, carried_attr, True)
@@ -803,11 +816,11 @@ class CombatAssistantModule(BaseModule):
             else:
                 if (now - last_seen) > self.BOMB_GRACE_PERIOD:
                     if carried:
-                        print(f"[DEBUG] Bomb {side.upper()} lost (grace period expired)")
+                        print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Bomb {side.upper()} lost (grace period expired)")
                     setattr(self, carried_attr, False)
 
-        process_bomb("ally", "ally_roster", "bomb_ally", 50, "bomb_ally_carried", "bomb_ally_last_seen", "bomb_ally_respawn_time", False)
-        process_bomb("enemy", "enemy_roster", "bomb_enemy", 33, "bomb_enemy_carried", "bomb_enemy_last_seen", "bomb_respawn_time", True)
+        process_bomb("ally", "ally_roster", "bomb_ally", 0.95, "bomb_ally_carried", "bomb_ally_last_seen", "bomb_ally_respawn_time", False)
+        process_bomb("enemy", "enemy_roster", "bomb_enemy", 0.95, "bomb_enemy_carried", "bomb_enemy_last_seen", "bomb_respawn_time", True)
 
     def _scan_capture(self):
         # Runs in Thread

@@ -1,14 +1,20 @@
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 
-# Try imports
 try:
     import mss
     HAS_MSS = True
 except ImportError:
     HAS_MSS = False
+
+try:
+    import cv2
+    import numpy as np
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 from PIL import Image
 
@@ -18,22 +24,45 @@ class ScreenScanner:
         if not HAS_MSS:
              self.last_error = "MSS Missing"
         
+        if HAS_CV2:
+            print("[DEBUG] Scanner initialized with OpenCV support.")
+        else:
+            print("[DEBUG] Scanner initialized in Legacy Mode (OpenCV not found).")
+            print("[WARN] Install opencv-python and numpy for better detection performance.")
+        
         self.lock = threading.Lock()
         
-        # Cache templates: Name -> PIL.Image
+        # Cache templates: Name -> { 'pil': Image, 'cv2': (bgr, mask) }
         self.templates = {}
 
     def load_template(self, name: str, path: Path):
-        print(f"[DEBUG] Loading template '{name}' from {path}")
+        # print(f"[DEBUG] Loading template '{name}' from {path}")
         if not path.exists():
             print(f"[DEBUG] Template file not found: {path}")
             return
         try:
-            # Load with PIL, convert to RGBA
-            img = Image.open(path).convert("RGBA")
-            # Resize logic if needed? Assuming 1:1 match
-            self.templates[name] = img
-            print(f"[DEBUG] Loaded '{name}' size={img.size}")
+            # 1. Load Legacy (PIL)
+            img_pil = Image.open(path).convert("RGBA")
+            
+            # 2. Load CV2
+            cv_data = None
+            if HAS_CV2:
+                # IMREAD_UNCHANGED = -1
+                img_cv = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                if img_cv is not None:
+                    if img_cv.shape[2] == 4:
+                        bgr = img_cv[:, :, :3]
+                        alpha = img_cv[:, :, 3]
+                        cv_data = (bgr, alpha)
+                    else:
+                        cv_data = (img_cv, None)
+                    # print(f"[DEBUG] Loaded '{name}' (CV2) size={img_cv.shape}")
+            
+            self.templates[name] = {
+                "pil": img_pil,
+                "cv2": cv_data
+            }
+            # print(f"[DEBUG] Loaded '{name}' (PIL) size={img_pil.size}")
         except Exception as e:
             print(f"[DEBUG] Failed to load template '{name}': {e}")
             pass
@@ -42,34 +71,112 @@ class ScreenScanner:
         self,
         region: Tuple[int, int, int, int],
         template_name: str,
-        threshold=50,
+        threshold=0.8, # Interpreted as Confidence (CV2) or Diff-Derived (Legacy)
         *,
         return_positions: bool = False,
         max_results: int = 1,
     ):
         """
-        Pure Python Template Matching with Multi-Scale support.
-
-        region: (left, top, width, height)
-        threshold: Max average pixel difference (0-255). Lower is stricter.
-        return_positions: when True, collect up to `max_results` absolute (x, y) matches instead of
-            short-circuiting on the first hit.
+        Template Matching (OpenCV preferred, PIL fallback).
         """
         if not HAS_MSS or template_name not in self.templates:
-            if not HAS_MSS: print("[DEBUG] MSS not available")
-            if template_name not in self.templates: print(f"[DEBUG] Template '{template_name}' not loaded")
             return False
 
-        orig_template = self.templates[template_name]
+        if HAS_CV2 and self.templates[template_name]["cv2"] is not None:
+             # OpenCV Path
+             # Threshold handling: If > 1.0 (Old Legacy param passed), convert it.
+             # Old 45 (approx 18%) -> New 0.8?
+             # Let's assume input is updated to 0.8-0.95 range.
+             # If input > 1, force a default safe confidence.
+             eff_thresh = threshold
+             if eff_thresh > 1.0:
+                 eff_thresh = 0.8
+             
+             return self._find_template_cv2(region, template_name, eff_thresh, return_positions, max_results)
+        else:
+             # Legacy Path
+             # Convert Confidence -> Diff if needed
+             eff_thresh = threshold
+             if eff_thresh < 1.0:
+                 # 0.8 confidence -> 0.2 diff -> approx 50 diff score?
+                 # This is rough estimate
+                 eff_thresh = (1.0 - threshold) * 255
+             
+             return self._find_template_legacy(region, template_name, eff_thresh, return_positions, max_results)
+
+    def _find_template_cv2(self, region, template_name, threshold, return_positions, max_results):
+        tpl_bgr, tpl_mask = self.templates[template_name]["cv2"]
+        h, w = tpl_bgr.shape[:2]
+        
+        monitor = {
+            "top": int(region[1]),
+            "left": int(region[0]),
+            "width": int(region[2]),
+            "height": int(region[3]),
+        }
+        
+        if monitor["width"] < w or monitor["height"] < h:
+            return [] if return_positions else False
+
+        with self.lock:
+            try:
+                with mss.mss() as sct:
+                    sct_img = sct.grab(monitor)
+                    # MSS gives BGRA
+                    screen_arr = np.array(sct_img)
+                    # Drop Alpha for matching, convert to BGR
+                    screen_bgr = screen_arr[:, :, :3] # BGRA to BGR simply by slicing? Yes.
+                    # Or cvtColor? Slicing is faster if buffer is consistent.
+                    # Warning: MSS BGRA might be BGRX. Slicing is safe.
+
+                    # Match
+                    if tpl_mask is not None:
+                        res = cv2.matchTemplate(screen_bgr, tpl_bgr, cv2.TM_CCORR_NORMED, mask=tpl_mask)
+                    else:
+                        res = cv2.matchTemplate(screen_bgr, tpl_bgr, cv2.TM_CCOEFF_NORMED)
+                    
+                    # Filter
+                    locs = np.where(res >= threshold)
+                    # locs = (y_indices, x_indices)
+                    
+                    found = []
+                    # iterate results
+                    for pt in zip(*locs[::-1]): # pt = (x, y)
+                        val = res[pt[1], pt[0]]
+                        found.append((val, pt[0], pt[1]))
+                    
+                    # Sort desc
+                    found.sort(key=lambda x: x[0], reverse=True)
+                    
+                    final_matches = []
+                    for val, x, y in found:
+                        # Dedup
+                        is_new = True
+                        for _, ex, ey in final_matches:
+                            if abs(x - ex) < w/2 and abs(y - ey) < h/2: 
+                                is_new = False
+                                break
+                        if is_new:
+                            final_matches.append((val, x, y))
+                            if len(final_matches) >= max_results:
+                                break
+                    
+                    if return_positions:
+                        return [(monitor["left"]+x, monitor["top"]+y, val) for val, x, y in final_matches]
+                    else:
+                        return len(final_matches) > 0
+
+            except Exception as e:
+                print(f"[DEBUG] CV2 Error: {e}")
+                return [] if return_positions else False
+
+    def _find_template_legacy(self, region, template_name, threshold, return_positions, max_results):
+        orig_template = self.templates[template_name]["pil"]
         found_positions = [] if return_positions else None
         
-        # Check region vs template sizes for 1.0x
-        # If region is smaller than even smallest scale, fail
         t_w, t_h = orig_template.size
         # Allow regions that match template size (even within 1px margin)
         if region[2] < t_w or region[3] < t_h:
-             # Just warn, don't fail immediately, but matching will likely fail or crash if we don't handle bounds
-             # Actually, the logic below (range(sh-th)) will just not loop if region < template
              pass
 
         monitor = {
@@ -81,7 +188,6 @@ class ScreenScanner:
 
         with self.lock:
             try:
-                # Use context manager for mss ensures thread safety and proper cleanup
                 with mss.mss() as sct:
                     sct_img = sct.grab(monitor)
                 
@@ -107,7 +213,6 @@ class ScreenScanner:
                     template_pixels = template_img.load()
 
                     # FIND VALID ANCHOR (Opaque Pixel)
-                    # We want a very solid anchor to skip empty checking
                     cx, cy = -1, -1
                     for ay in range(0, th, 2):
                         for ax in range(0, tw, 2):
@@ -120,79 +225,50 @@ class ScreenScanner:
                     
                     c_pix = template_pixels[cx, cy]
                     cr, cg, cb = c_pix[0], c_pix[1], c_pix[2]
-                    # Anchor usage depends on high alpha (solid)
                     ca = c_pix[3] if len(c_pix) > 3 else 255
                     use_anchor = (ca > 200)
 
-                    # Scan Screen for this Scale
-                    # Optimization: Step size 2 for better precision
-                    for y in range(0, sh - th, 2):
-                        # Yield to main thread every few rows to prevent UI freeze
+                    for y in range(0, sh - th, 1 if threshold < 20 else 2): # Slower scan for low threshold
                         if y % 20 == 0:
                             time.sleep(0.001)
 
-                        for x in range(0, sw - tw, 2):
+                        for x in range(0, sw - tw, 1 if threshold < 20 else 2):
                             if use_anchor:
                                 sp = screen_pixels[x+cx, y+cy]
-                                # Relaxed anchor check (threshold * 5) to prevent skipping valid matches due to single-pixel noise
                                 if abs(sp[0]-cr) + abs(sp[1]-cg) + abs(sp[2]-cb) > (threshold * 5):
                                     continue
                                 
                             total_diff = 0
                             checked_pixels = 0
-                            
-                            # Check grid - NOW CHECKING EVERY PIXEL (Step 1) for maximum reliability
                             abort = False
                             
-                            for py in range(0, th, 1):
-                                for px in range(0, tw, 1):
+                            step = 1 if threshold < 20 else 1 # Always detail
+                            for py in range(0, th, step):
+                                for px in range(0, tw, step):
                                     t_pix = template_pixels[px, py]
-                                    
-                                    # CHECK 1: Alpha (Transparency)
-                                    # Skip semi-transparent pixels
                                     if t_pix[3] < 200: continue
-
-                                    # CHECK 2: Brightness (Ignore Dark Backgrounds)
-                                    # If template pixel is very dark (sum RGB < 50), skip it.
-                                    # This prevents matching the black 'empty' space of the icon against dark space backgrounds.
-                                    if (t_pix[0] + t_pix[1] + t_pix[2]) < 50: continue
-                                    
                                     s_pix = screen_pixels[x+px, y+py]
-                                    # Calculate difference across 3 channels (RGB)
                                     pixel_diff = abs(s_pix[0]-t_pix[0]) + abs(s_pix[1]-t_pix[1]) + abs(s_pix[2]-t_pix[2])
                                     total_diff += pixel_diff
                                     checked_pixels += 1
-                                    
-                                    # Abort if bad match
-                                    # threshold * 3 because we are summing differences of 3 Channels (R+G+B)
                                     if checked_pixels > 5 and (total_diff / checked_pixels) > (threshold * 3):
                                         abort = True
                                         break
                                 if abort: break
                             
-                            # We need enough checked pixels to be confident.
                             if not abort and checked_pixels > 10:
                                 avg_diff = total_diff / checked_pixels
                                 if avg_diff < best_diff:
                                     best_diff = avg_diff
 
                                 limit = threshold * 3
-                                # Only print near misses or debugging (disabled for production spam reduction)
-                                # if avg_diff < limit or avg_diff < 200:
-                                    # print(f"[DEBUG] Potential '{template_name}' at ({x},{y}) - Diff: {avg_diff:.2f} (Pixels: {checked_pixels}) Limit: {limit}")
-
                                 if avg_diff < limit:
-                                    # Match Found!
-                                    # print(f"[DEBUG] Found '{template_name}' at ({x},{y}) with diff {avg_diff:.2f}")
                                     if return_positions:
-                                        found_positions.append((monitor["left"] + x, monitor["top"] + y))
+                                        found_positions.append((monitor["left"] + x, monitor["top"] + y, avg_diff))
                                         if len(found_positions) >= max_results:
                                             return found_positions
                                     else:
                                         return True
-                
-                # If we get here, no match found or not enough matches collected
-                # print(f"[DEBUG] Scan '{template_name}' failed. Best Diff: {best_diff:.2f}")
                 return found_positions if return_positions else False
             except Exception as e:
                 self.last_error = f"Template Error: {e}"
@@ -203,7 +279,6 @@ class ScreenScanner:
         """Returns (R, G, B)"""
         if not HAS_MSS:
             return (0, 0, 0)
-            
         monitor = {
             "top": int(y),
             "left": int(x),
@@ -214,9 +289,6 @@ class ScreenScanner:
             try:
                 with mss.mss() as sct:
                     sct_img = sct.grab(monitor)
-                # sct stores as BGRA, access raw
-                # pixel is at [0][0]
-                # data is accessible via sct_img.pixel(0, 0) -> (r, g, b)
                 return sct_img.pixel(0, 0)
             except Exception as e:
                 self.last_error = f"Pixel Error: {e}"
