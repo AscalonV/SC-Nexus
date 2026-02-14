@@ -80,6 +80,12 @@ class CombatAssistantModule(BaseModule):
         self.bomb_ally_last_seen = 0.0
         self.bomb_enemy_last_seen = 0.0
         self.BOMB_GRACE_PERIOD = 3.0
+        self.BOMB_CONFIRM_SECONDS = 1.0
+        self.BOMB_POSITION_TOLERANCE = 3
+        self.bomb_detection_candidates = {
+            "ally": {"pos": None, "since": 0.0},
+            "enemy": {"pos": None, "since": 0.0},
+        }
 
         # Create Scan Lock
         self.scan_lock = threading.Lock()
@@ -551,14 +557,36 @@ class CombatAssistantModule(BaseModule):
                 # Reset visual states
                 self.bomb_enemy_carried = False
                 self.bomb_ally_carried = False
+                self.bomb_detection_candidates = {
+                    "ally": {"pos": None, "since": 0.0},
+                    "enemy": {"pos": None, "since": 0.0},
+                }
                 
             # Match End
-            if GAME_END_RE.search(line):
+            if (
+                GAME_END_RE.search(line)
+                or "Gameplay finished" in line
+                or "Session finished" in line
+                or "Quit application" in line
+            ):
                 self.match_active_signal = False
                 self.match_is_conquest = False # Reset
                 self.agony_active_until = 0.0
                 self.agony_cooldown_until = 0.0
                 self.last_damage_time = 0.0
+                
+                # Reset Conquest timers
+                self.torp_launch_time = 0.0
+                self.torp_next_wave = 0.0
+                self.bomb_respawn_time = 0.0
+                self.bomb_ally_respawn_time = 0.0
+                self.bomb_enemy_carried = False
+                self.bomb_ally_carried = False
+                self.bomb_detection_candidates = {
+                    "ally": {"pos": None, "since": 0.0},
+                    "enemy": {"pos": None, "since": 0.0},
+                }
+                
                 self._update_visibility_logic()
 
             # Agony
@@ -602,7 +630,8 @@ class CombatAssistantModule(BaseModule):
                     if (now - self.torp_launch_time) > 15.0: 
                         self.torp_launch_time = now
                         self.torp_next_wave = now + 65.5
-                        self.overlay.show()
+                        self.last_damage_time = now
+                        self._update_visibility_logic()
                         self._play_sound(SND_TORP)
                 
             # Bomb (Log Fallback)
@@ -752,6 +781,11 @@ class CombatAssistantModule(BaseModule):
                     return True
         return False
 
+    def _is_near_position(self, pos_a, pos_b, tolerance: int) -> bool:
+        if not pos_a or not pos_b:
+            return False
+        return abs(pos_a[0] - pos_b[0]) <= tolerance and abs(pos_a[1] - pos_b[1]) <= tolerance
+
     def _scan_bombs(self):
         # Runs in Thread
         
@@ -778,42 +812,64 @@ class CombatAssistantModule(BaseModule):
             carried = getattr(self, carried_attr)
             respawn_time = getattr(self, respawn_attr)
             last_seen = getattr(self, last_seen_attr)
+            candidate = self.bomb_detection_candidates.get(side, {"pos": None, "since": 0.0})
+            candidate_pos = candidate.get("pos")
+            candidate_since = candidate.get("since", 0.0)
+
+            def _save_candidate(pos, since):
+                self.bomb_detection_candidates[side] = {"pos": pos, "since": since}
 
             if matches:
+                observed_pos = None
+                if candidate_pos:
+                    best = min(matches, key=lambda m: abs(m[0] - candidate_pos[0]) + abs(m[1] - candidate_pos[1]))
+                    if self._is_near_position((best[0], best[1]), candidate_pos, self.BOMB_POSITION_TOLERANCE * 2):
+                        observed_pos = (best[0], best[1])
+                if observed_pos is None:
+                    observed_pos = (matches[0][0], matches[0][1])
+
                 if not carried:
-                    try:
-                        # Log confidence scores properly if float (0-1) or legacy diff
-                        debug_str = []
-                        for m in matches:
-                            val = m[2]
-                            if val <= 1.0:
-                                debug_str.append(f"({m[0]}, {m[1]}) conf={val*100:.1f}%")
-                            else:
-                                debug_str.append(f"({m[0]}, {m[1]}) diff={val:.1f}")
-                        details = ", ".join(debug_str)
-                    except Exception:
-                        details = str(matches)
-                    print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Bomb {side.upper()} detected (state change). Matches: {details}")
+                    if candidate_pos is None:
+                        _save_candidate(observed_pos, now)
+                    elif self._is_near_position(observed_pos, candidate_pos, self.BOMB_POSITION_TOLERANCE):
+                        _save_candidate(observed_pos, candidate_since)
+                        if (now - candidate_since) >= self.BOMB_CONFIRM_SECONDS:
+                            try:
+                                debug_str = []
+                                for m in matches:
+                                    val = m[2]
+                                    if val <= 1.0:
+                                        debug_str.append(f"({m[0]}, {m[1]}) conf={val*100:.1f}%")
+                                    else:
+                                        debug_str.append(f"({m[0]}, {m[1]}) diff={val:.1f}")
+                                details = ", ".join(debug_str)
+                            except Exception:
+                                details = str(matches)
+                            print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Bomb {side.upper()} confirmed after {self.BOMB_CONFIRM_SECONDS:.1f}s. Matches: {details}")
 
-                setattr(self, last_seen_attr, now)
-                setattr(self, carried_attr, True)
+                            setattr(self, carried_attr, True)
+                            setattr(self, last_seen_attr, now)
 
-                timer_active = now < respawn_time
-                has_two_icons = self._has_multiple_bomb_icons(matches)
+                            timer_active = now < respawn_time
+                            if not timer_active:
+                                setattr(self, respawn_attr, now + 120.0)
+                                if play_sound:
+                                    self._play_sound(SND_BOMB)
+                    else:
+                        _save_candidate(observed_pos, now)
+                else:
+                    setattr(self, last_seen_attr, now)
+                    _save_candidate(observed_pos, now)
 
-                should_start_timer = False
-                if not carried:
-                    # Only start a new timer if the previous one is not already running.
-                    should_start_timer = not timer_active
-                elif not timer_active and has_two_icons:
-                    # Timer expired while the original bomb was still carried; a second icon means a new bomb spawned.
-                    should_start_timer = True
+                    timer_active = now < respawn_time
+                    has_two_icons = self._has_multiple_bomb_icons(matches)
 
-                if should_start_timer:
-                    setattr(self, respawn_attr, now + 120.0)
-                    if play_sound:
-                        self._play_sound(SND_BOMB)
+                    if not timer_active and has_two_icons:
+                        setattr(self, respawn_attr, now + 120.0)
+                        if play_sound:
+                            self._play_sound(SND_BOMB)
             else:
+                _save_candidate(None, 0.0)
                 if (now - last_seen) > self.BOMB_GRACE_PERIOD:
                     if carried:
                         print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Bomb {side.upper()} lost (grace period expired)")
