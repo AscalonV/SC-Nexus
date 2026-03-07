@@ -74,25 +74,52 @@ class App(tk.Tk):
         for widget in self.content.winfo_children():
             widget.destroy()
 
-        ttk.Label(self.navbar, text="Launchpad", font=("Segoe UI", 12, "bold"), style="Section.TLabel").pack(side=tk.LEFT)
+        C = self.colors
+        panel_bg = C["panel"]
 
-        # Center container for tiles
-        tile_container = ttk.Frame(self.content, style="App.TFrame")
-        tile_container.pack(anchor=tk.NW, padx=40, pady=40)
+        # --- Navbar ---
+        tk.Label(self.navbar, text="SC NEXUS", font=("Segoe UI", 12, "bold"),
+                 bg=panel_bg, fg=C["accent"]).pack(side=tk.LEFT)
+        tk.Label(self.navbar, text="  ·  Launchpad", font=("Segoe UI", 11),
+                 bg=panel_bg, fg=C["muted"]).pack(side=tk.LEFT)
+        ttk.Button(self.navbar, text="⚙  Settings",
+                   command=self._open_global_settings,
+                   style="Accent.TButton").pack(side=tk.RIGHT, padx=4)
+
+        # --- Hero Section ---
+        hero = tk.Frame(self.content, bg=C["bg"])
+        hero.pack(fill=tk.X, padx=60, pady=(40, 0))
+        tk.Label(hero, text="SC NEXUS", font=("Segoe UI", 34, "bold"),
+                 bg=C["bg"], fg=C["accent"]).pack(anchor=tk.W)
+        tk.Label(hero, text="MISSION CONTROL", font=("Segoe UI", 12, "bold"),
+                 bg=C["bg"], fg=C["muted"]).pack(anchor=tk.W, pady=(2, 0))
+        tk.Frame(self.content, height=1, bg=C["border"]).pack(fill=tk.X, padx=60, pady=(20, 30))
+
+        # --- Module Tiles ---
+        MODULE_META = {
+            "Combat Analyzer":  {"color": "#3de7ff", "icon": "◈"},
+            "Combat Assistant": {"color": "#4de88e", "icon": "◉"},
+            "Self-Torp":        {"color": "#ff8c42", "icon": "◆"},
+            "Player Stats":     {"color": "#b96aff", "icon": "◇"},
+        }
+
+        tile_grid = tk.Frame(self.content, bg=C["bg"])
+        tile_grid.pack(padx=60, anchor=tk.W)
+
+        TILE_W, TILE_H = 300, 220
+        TILE_BG        = C["panel"]
+        TILE_BG_HOVER  = C["surface"]
+        BORDER_CLR     = C["border"]
+        BORDER_HOVER   = C["accent"]
 
         row = 0
         col = 0
         max_cols = 3
 
         for name, module in self.modules.items():
-            # Tile Frame (Border)
-            tile_border = ttk.Frame(tile_container, style="TileBorder.TFrame", padding=1)
-            tile_border.grid(row=row, column=col, padx=20, pady=20)
-
-            # Inner Content
-            tile = ttk.Frame(tile_border, style="Tile.TFrame", padding=20, width=280, height=200)
-            tile.pack_propagate(False)
-            tile.pack(fill=tk.BOTH, expand=True)
+            meta      = MODULE_META.get(name, {"color": C["accent"], "icon": "◎"})
+            mod_color = meta["color"]
+            mod_icon  = meta["icon"]
 
             status_text = ""
             status_fn = getattr(module, "tile_status", None)
@@ -100,80 +127,149 @@ class App(tk.Tk):
                 try:
                     status_text = status_fn()
                 except Exception:
-                    status_text = ""
+                    pass
             elif isinstance(status_fn, str):
                 status_text = status_fn
 
-            inline_status = bool(status_text) and len(status_text) <= 8
-
-            # Header with title (optional inline status)
-            header = ttk.Frame(tile, style="Tile.TFrame")
-            header.pack(fill=tk.X)
-
-            title_text = f"{name} ({status_text})" if inline_status else name
-            l_title = ttk.Label(header, text=title_text, font=("Segoe UI", 16, "bold"), style="TileTitle.TLabel")
-            l_title.pack(side=tk.LEFT, anchor=tk.W, pady=(10, 10))
-
             desc = getattr(module, "description", "")
+
+            # Outer border frame — 1-px colour border via padding
+            tile_border = tk.Frame(tile_grid, bg=BORDER_CLR, padx=1, pady=1)
+            tile_border.grid(row=row, column=col, padx=16, pady=16, sticky="nw")
+
+            # Coloured accent strip at the top
+            accent_strip = tk.Frame(tile_border, height=4, bg=mod_color)
+            accent_strip.pack(fill=tk.X)
+
+            # Main tile body
+            tile_body = tk.Frame(tile_border, bg=TILE_BG, width=TILE_W, height=TILE_H)
+            tile_body.pack_propagate(False)
+            tile_body.pack(fill=tk.BOTH, expand=True)
+
+            # Icon + heading row
+            header_frame = tk.Frame(tile_body, bg=TILE_BG)
+            header_frame.pack(fill=tk.X, padx=20, pady=(18, 0))
+
+            l_icon = tk.Label(header_frame, text=mod_icon, font=("Segoe UI", 18),
+                              bg=TILE_BG, fg=mod_color)
+            l_icon.pack(side=tk.LEFT, anchor=tk.N, pady=(2, 0))
+
+            heading_frame = tk.Frame(header_frame, bg=TILE_BG)
+            heading_frame.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
+
+            l_title = tk.Label(heading_frame, text=name, font=("Segoe UI", 13, "bold"),
+                               bg=TILE_BG, fg=C["text"], anchor=tk.W)
+            l_title.pack(anchor=tk.W)
+
+            l_status = None
+            if status_text:
+                l_status = tk.Label(heading_frame, text=status_text, font=("Segoe UI", 9),
+                                    bg=TILE_BG, fg=mod_color, anchor=tk.W)
+                l_status.pack(anchor=tk.W)
+
+            # Description
             l_desc = None
             if desc:
-                l_desc = ttk.Label(tile, text=desc, wraplength=240, justify=tk.CENTER, style="TileDesc.TLabel")
-                l_desc.pack(anchor=tk.CENTER)
+                l_desc = tk.Label(tile_body, text=desc, font=("Segoe UI", 10),
+                                  wraplength=260, justify=tk.LEFT,
+                                  bg=TILE_BG, fg=C["muted"], anchor=tk.W)
+                l_desc.pack(anchor=tk.W, padx=20, pady=(12, 0))
 
-            # Footer with optional settings cog aligned bottom-right
-            footer = ttk.Frame(tile, style="Tile.TFrame")
-            footer.pack(side=tk.BOTTOM, fill=tk.X, padx=(0, 4), pady=(8, 4))
+            # Footer
+            footer_frame = tk.Frame(tile_body, bg=TILE_BG)
+            footer_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=12)
+
+            def _make_open_btn(parent, m=module, color=mod_color):
+                btn = tk.Button(parent, text="Open  →", font=("Segoe UI", 9, "bold"),
+                                bg=C["bg"], fg=color,
+                                activebackground=color, activeforeground=C["bg"],
+                                relief=tk.FLAT, bd=0, padx=10, pady=4,
+                                cursor="hand2",
+                                command=lambda mod=m: self.show_module(mod))
+                btn.pack(side=tk.RIGHT)
+                return btn
+
+            open_btn = _make_open_btn(footer_frame)
+
+            cog_btn = None
             if callable(getattr(module, "open_settings", None)):
-                ttk.Button(
-                    footer,
-                    text="⚙",
-                    width=3,
-                    command=lambda m=module: self._open_module_settings(m),
-                    style="TButton"
-                ).pack(side=tk.RIGHT)
+                def _make_cog_btn(parent, m=module):
+                    btn = tk.Button(parent, text="⚙", font=("Segoe UI", 10),
+                                    bg=C["bg"], fg=C["muted"],
+                                    activebackground=C["border"], activeforeground=C["text"],
+                                    relief=tk.FLAT, bd=0, padx=6, pady=4,
+                                    cursor="hand2",
+                                    command=lambda mod=m: self._open_module_settings(mod))
+                    btn.pack(side=tk.RIGHT, padx=(0, 6))
+                    return btn
+                cog_btn = _make_cog_btn(footer_frame)
 
-            # Hover Effects & Click Binding
-            l_status = None
-            if status_text and not inline_status:
-                l_status = ttk.Label(tile, text=status_text, justify=tk.LEFT, style="TileDesc.TLabel")
-                l_status.pack(anchor=tk.W, pady=(0, 2))
-
-            widgets = [tile, header, footer, l_title]
+            # Collect widgets for hover effects
+            hover_bg_frames = [tile_body, header_frame, heading_frame, footer_frame]
+            hover_labels    = [l_icon, l_title]
             if l_desc:
-                widgets.append(l_desc)
+                hover_labels.append(l_desc)
             if l_status:
-                widgets.append(l_status)
+                hover_labels.append(l_status)
 
-            def on_enter(e, w_list=widgets, border_frame=tile_border):
-                border_frame.configure(style="TileBorderHover.TFrame")
-                for w in w_list:
-                    if "Title" in w.winfo_class() or "Title" in str(w.cget("style")):
-                        w.configure(style="TileTitleHover.TLabel")
-                    elif "Desc" in str(w.cget("style")):
-                        w.configure(style="TileDescHover.TLabel")
-                    else:
-                        w.configure(style="TileHover.TFrame")
+            # Mutable flag — avoids redundant .config() calls when mouse crosses
+            # nested child boundaries (which fire Enter/Leave repeatedly).
+            _state = [False]  # [hovered]
 
-            def on_leave(e, w_list=widgets, border_frame=tile_border):
-                border_frame.configure(style="TileBorder.TFrame")
-                for w in w_list:
-                    if "Title" in w.winfo_class() or "Title" in str(w.cget("style")):
-                        w.configure(style="TileTitle.TLabel")
-                    elif "Desc" in str(w.cget("style")):
-                        w.configure(style="TileDesc.TLabel")
-                    else:
-                        w.configure(style="Tile.TFrame")
+            def on_enter(e, b=tile_border, bf=hover_bg_frames, lf=hover_labels,
+                         title=l_title, o=open_btn, cog=cog_btn, s=_state):
+                if s[0]:
+                    return
+                s[0] = True
+                b.config(bg=BORDER_HOVER)
+                for f in bf:
+                    f.config(bg=TILE_BG_HOVER)
+                for lbl in lf:
+                    lbl.config(bg=TILE_BG_HOVER)
+                title.config(fg=C["accent_soft"])
+                o.config(bg=TILE_BG_HOVER)
+                if cog:
+                    cog.config(bg=TILE_BG_HOVER)
+
+            def on_leave(e, b=tile_border, bf=hover_bg_frames, lf=hover_labels,
+                         title=l_title, o=open_btn, cog=cog_btn, s=_state):
+                if not s[0]:
+                    return
+                # Only reset when the pointer actually leaves the outer border frame
+                rx, ry = e.widget.winfo_rootx() + e.x, e.widget.winfo_rooty() + e.y
+                bx, by = b.winfo_rootx(), b.winfo_rooty()
+                if bx <= rx <= bx + b.winfo_width() and by <= ry <= by + b.winfo_height():
+                    return
+                s[0] = False
+                b.config(bg=BORDER_CLR)
+                for f in bf:
+                    f.config(bg=TILE_BG)
+                for lbl in lf:
+                    lbl.config(bg=TILE_BG)
+                title.config(fg=C["text"])
+                o.config(bg=C["bg"])
+                if cog:
+                    cog.config(bg=C["bg"])
 
             def on_click(e, m=module):
                 handled = False
                 try:
                     handled = bool(m.on_tile_click())
                 except Exception:
-                    handled = False
+                    pass
                 if not handled:
                     self.show_module(m)
 
-            for w in widgets:
+            # Bind hover and click to all non-button widgets
+            click_widgets = [tile_border, accent_strip, tile_body,
+                             header_frame, heading_frame, footer_frame,
+                             l_icon, l_title]
+            if l_desc:
+                click_widgets.append(l_desc)
+            if l_status:
+                click_widgets.append(l_status)
+
+            for w in click_widgets:
                 w.bind("<Enter>", on_enter)
                 w.bind("<Leave>", on_leave)
                 w.bind("<Button-1>", on_click)
@@ -183,35 +279,30 @@ class App(tk.Tk):
                 col = 0
                 row += 1
 
-        # Settings Button (Bottom Right)
-        settings_frame = ttk.Frame(self.content, style="App.TFrame")
-        settings_frame.place(relx=1.0, rely=1.0, anchor="se", x=-20, y=-20)
-        
-        ttk.Button(
-            settings_frame, 
-            text="⚙", 
-            width=3, 
-            command=self._open_global_settings,
-            style="TButton"
-        ).pack()
-
     def _open_global_settings(self):
         win = tk.Toplevel(self)
         win.title("Settings")
         win.configure(bg=self.colors["bg"])
         win.resizable(False, False)
-        
-        w, h = 500, 250
+
+        w, h = 520, 330
         x = self.winfo_x() + (self.winfo_width() // 2) - (w // 2)
         y = self.winfo_y() + (self.winfo_height() // 2) - (h // 2)
         win.geometry(f"{w}x{h}+{x}+{y}")
-        
+
+        # Accent strip at top
+        tk.Frame(win, height=3, bg=self.colors["accent"]).pack(fill=tk.X)
+
         container = ttk.Frame(win, style="App.TFrame", padding=20)
         container.pack(fill=tk.BOTH, expand=True)
-        
+
+        tk.Label(container, text="Settings", font=("Segoe UI", 14, "bold"),
+                 bg=self.colors["bg"], fg=self.colors["accent"]).grid(
+                 row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
         # Username
-        ttk.Label(container, text="Username:", style="LabelMuted.TLabel").grid(row=0, column=0, sticky="w", pady=10)
-        
+        ttk.Label(container, text="Username:", style="LabelMuted.TLabel").grid(row=1, column=0, sticky="w", pady=8)
+
         user_var = tk.StringVar(value=self.config.username)
         def save_user(*_):
             self.config.username = user_var.get()
@@ -220,15 +311,15 @@ class App(tk.Tk):
             for module in self.modules.values():
                 if hasattr(module, "username_var"):
                     module.username_var.set(user_var.get())
-        
+
         user_var.trace_add("write", save_user)
-        ttk.Entry(container, textvariable=user_var, style="Futuristic.TEntry", width=30).grid(row=0, column=1, sticky="w", padx=10)
-        
+        ttk.Entry(container, textvariable=user_var, style="Futuristic.TEntry", width=30).grid(row=1, column=1, sticky="w", padx=10)
+
         # Logs Path
-        ttk.Label(container, text="Logs Path:", style="LabelMuted.TLabel").grid(row=1, column=0, sticky="w", pady=10)
-        
+        ttk.Label(container, text="Logs Path:", style="LabelMuted.TLabel").grid(row=2, column=0, sticky="w", pady=8)
+
         path_var = tk.StringVar(value=self.config.logs_path)
-        
+
         def browse_path():
             from tkinter import filedialog
             from pathlib import Path
@@ -240,13 +331,23 @@ class App(tk.Tk):
                 for module in self.modules.values():
                     if hasattr(module, "logs_path_var"):
                         module.logs_path_var.set(p)
-        
+
         path_frame = ttk.Frame(container, style="App.TFrame")
-        path_frame.grid(row=1, column=1, sticky="ew", padx=10)
+        path_frame.grid(row=2, column=1, sticky="ew", padx=10)
         ttk.Entry(path_frame, textvariable=path_var, state="readonly", style="Futuristic.TEntry").pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(path_frame, text="...", width=3, command=browse_path, style="TButton").pack(side=tk.LEFT, padx=(5,0))
-        
-        ttk.Button(container, text="Close", command=win.destroy, style="Accent.TButton").grid(row=2, column=1, sticky="e", pady=20)
+        ttk.Button(path_frame, text="...", width=3, command=browse_path, style="TButton").pack(side=tk.LEFT, padx=(5, 0))
+
+        # Separator
+        tk.Frame(container, height=1, bg=self.colors["border"]).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(12, 4))
+
+        # Console Log
+        ttk.Label(container, text="Console Log:", style="LabelMuted.TLabel").grid(row=4, column=0, sticky="w", pady=8)
+        ttk.Button(container, text="Show Console", command=self._show_console,
+                   style="TButton").grid(row=4, column=1, sticky="w", padx=10)
+
+        ttk.Button(container, text="Close", command=win.destroy,
+                   style="Accent.TButton").grid(row=5, column=1, sticky="e", pady=16)
 
     def _open_module_settings(self, module: BaseModule):
         handler = getattr(module, "open_settings", None)
@@ -255,6 +356,15 @@ class App(tk.Tk):
                 handler()
             except Exception:
                 pass
+
+    def _show_console(self):
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        except Exception:
+            pass
 
     def show_module(self, module: BaseModule) -> None:
         if self.current_module and self.current_module != module:
@@ -360,6 +470,24 @@ class App(tk.Tk):
             bordercolor=[("active", accent)],
         )
 
+        style.configure(
+            "Futuristic.TEntry",
+            fieldbackground=surface,
+            foreground=text,
+            background=surface,
+            bordercolor=border,
+            darkcolor=border,
+            lightcolor=border,
+            selectbackground=accent,
+            selectforeground=bg,
+            padding=5,
+        )
+        style.map(
+            "Futuristic.TEntry",
+            fieldbackground=[("readonly", bg), ("disabled", bg)],
+            bordercolor=[("focus", accent)],
+        )
+
         # Tile Styles
         style.configure("TileBorder.TFrame", background=border)
         style.configure("TileBorderHover.TFrame", background=accent)
@@ -406,6 +534,14 @@ def run_app() -> None:
         # Per-Monitor (2) causes the main window to be huge on low-DPI screens because Tkinter widgets don't auto-scale well.
         # We will handle Overlay positioning manually using SetWindowPos.
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
+
+        # Hide console window on startup
+        try:
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+        except Exception:
+            pass
 
         # Early check for Self-Torp admin requirement
         st_settings_path = USER_DATA_DIR / "self_torp_settings.json"
