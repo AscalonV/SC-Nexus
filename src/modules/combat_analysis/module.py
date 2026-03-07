@@ -163,11 +163,18 @@ class CombatModule(BaseModule):
         win.attributes("-topmost", True)
         
         # Center the window
-        w, h = 500, 300
+        w, h = 500, 360
         x = self.app.winfo_x() + (self.app.winfo_width() // 2) - (w // 2)
         y = self.app.winfo_y() + (self.app.winfo_height() // 2) - (h // 2)
         win.geometry(f"{w}x{h}+{x}+{y}")
-        
+
+        tk.Frame(win, height=3, bg=self.colors["accent"]).pack(fill=tk.X)
+        _hdr = tk.Frame(win, bg=self.colors["bg"], padx=20, pady=12)
+        _hdr.pack(fill=tk.X)
+        tk.Label(_hdr, text="Combat Analysis Settings", font=("Segoe UI", 14, "bold"),
+                 bg=self.colors["bg"], fg=self.colors["accent"]).pack(anchor=tk.W)
+        tk.Frame(win, height=1, bg=self.colors["border"]).pack(fill=tk.X)
+
         container = ttk.Frame(win, style="App.TFrame", padding=20)
         container.pack(fill=tk.BOTH, expand=True)
         
@@ -201,9 +208,13 @@ class CombatModule(BaseModule):
         self.frame = ttk.Frame(parent, style="App.TFrame")
 
         # Top Control Bar
-        top_bar = ttk.Frame(self.frame, padding=10, style="Panel.TFrame")
-        top_bar.pack(fill=tk.X)
-        
+        _top_wrap = tk.Frame(self.frame, bg=self.colors["panel"])
+        _top_wrap.pack(fill=tk.X)
+        tk.Frame(_top_wrap, width=3, bg=self.colors["accent"]).pack(side=tk.LEFT, fill=tk.Y)
+        top_bar = ttk.Frame(_top_wrap, padding=10, style="Panel.TFrame")
+        top_bar.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Frame(self.frame, height=1, bg=self.colors["border"]).pack(fill=tk.X)
+
         # Left side: Fight Selector + Buttons
         # Fight Selector
         ttk.Label(top_bar, text="Select fight:", style="LabelMuted.TLabel").pack(side=tk.LEFT, padx=(0, 4))
@@ -311,7 +322,8 @@ class CombatModule(BaseModule):
         else:
             self.notebook.select(self.teams_tab)
 
-        # Status / progress (popup will show detailed progress; keep inline status text)
+        # Status / progress
+        tk.Frame(self.frame, height=1, bg=self.colors["border"]).pack(fill=tk.X)
         status_bar = ttk.Frame(self.frame, padding=(10, 0, 10, 10), style="Panel.TFrame")
         status_bar.pack(fill=tk.X)
         ttk.Label(status_bar, textvariable=self.status_var, style="LabelMuted.TLabel").pack(side=tk.LEFT)

@@ -160,6 +160,7 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
 class SelfTorpModule(BaseModule):
     name = "Self-Torp"
     description = "Trigger a torpedo sequence from a global hotkey."
+    has_module_view = False
 
     def __init__(self, app, config: AppConfig):
         self.app = app
@@ -214,14 +215,50 @@ class SelfTorpModule(BaseModule):
                 self._refresh_launchpad()
 
     def build(self, parent):
+        C = self.app.colors
         self.frame = ttk.Frame(parent, style="App.TFrame")
-        ttk.Label(
-            self.frame,
-            text="Self-Torp runs from the launchpad tile. Use the tile to toggle the hotkey.",
-            style="LabelMuted.TLabel",
-            wraplength=500,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, padx=20, pady=20)
+
+        # --- Hero ---
+        hero = tk.Frame(self.frame, bg=C["bg"])
+        hero.pack(fill=tk.X, padx=60, pady=(40, 0))
+        tk.Label(hero, text="SELF-TORP", font=("Segoe UI", 28, "bold"),
+                 bg=C["bg"], fg="#ff8c42").pack(anchor=tk.W)
+        tk.Label(hero, text="HOTKEY AUTOMATION", font=("Segoe UI", 11),
+                 bg=C["bg"], fg=C["muted"]).pack(anchor=tk.W, pady=(2, 0))
+        tk.Frame(self.frame, height=1, bg=C["border"]).pack(fill=tk.X, padx=60, pady=(16, 24))
+
+        # --- Status Card ---
+        area = tk.Frame(self.frame, bg=C["bg"])
+        area.pack(padx=60, anchor=tk.W)
+        card_bdr = tk.Frame(area, bg=C["border"], padx=1, pady=1)
+        card_bdr.pack(anchor=tk.W)
+        tk.Frame(card_bdr, height=3, bg="#ff8c42").pack(fill=tk.X)
+        card = tk.Frame(card_bdr, bg=C["panel"], width=380, padx=20, pady=16)
+        card.pack_propagate(False)
+        card.pack()
+
+        def _row(label, value, value_color=None):
+            r = tk.Frame(card, bg=C["panel"])
+            r.pack(fill=tk.X, pady=3)
+            tk.Label(r, text=label, font=("Segoe UI", 10),
+                     bg=C["panel"], fg=C["muted"]).pack(side=tk.LEFT)
+            tk.Label(r, text=value, font=("Segoe UI", 10, "bold"),
+                     bg=C["panel"], fg=value_color or C["text"]).pack(side=tk.RIGHT)
+
+        _row("Status", "Enabled" if self.enabled else "Disabled",
+             "#ff8c42" if self.enabled else C["muted"])
+        _row("Hotkey", self.hotkey_text)
+        _row("First key", self.first_key)
+        _row("Burst key (×15)", self.burst_key)
+
+        tk.Frame(card, height=1, bg=C["border"]).pack(fill=tk.X, pady=(8, 0))
+        btn_row = tk.Frame(card, bg=C["panel"])
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_row, text="⚙  Settings", command=self.open_settings,
+                   style="TButton").pack(side=tk.RIGHT)
+        tk.Label(card, text="Toggle on/off from the launchpad tile.",
+                 font=("Segoe UI", 9), bg=C["panel"], fg=C["muted"]).pack(anchor=tk.W, pady=(8, 0))
+
         return self.frame
 
     def on_show(self):
@@ -257,10 +294,18 @@ class SelfTorpModule(BaseModule):
         self._settings_win.configure(bg=self.app.colors.get("bg", "#0b1224"))
         self._settings_win.resizable(False, False)
 
-        w, h = 520, 300
+        w, h = 520, 360
         x = self.app.winfo_x() + (self.app.winfo_width() // 2) - (w // 2)
         y = self.app.winfo_y() + (self.app.winfo_height() // 2) - (h // 2)
         self._settings_win.geometry(f"{w}x{h}+{x}+{y}")
+
+        tk.Frame(self._settings_win, height=3, bg="#ff8c42").pack(fill=tk.X)
+        _hdr = tk.Frame(self._settings_win, bg=self.app.colors.get("bg", "#0b1224"), padx=16, pady=12)
+        _hdr.pack(fill=tk.X)
+        tk.Label(_hdr, text="Self-Torp Settings", font=("Segoe UI", 14, "bold"),
+                 bg=self.app.colors.get("bg", "#0b1224"), fg="#ff8c42").pack(anchor=tk.W)
+        tk.Frame(self._settings_win, height=1,
+                 bg=self.app.colors.get("border", "#24365c")).pack(fill=tk.X)
 
         container = ttk.Frame(self._settings_win, style="App.TFrame", padding=16)
         container.pack(fill=tk.BOTH, expand=True)

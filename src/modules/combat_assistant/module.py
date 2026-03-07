@@ -230,11 +230,15 @@ class CombatAssistantModule(BaseModule):
 
     def build(self, parent):
         self.frame = ttk.Frame(parent, style="App.TFrame")
-        
+
         # --- Header ---
-        controls = ttk.Frame(self.frame, style="Panel.TFrame", padding=10)
-        controls.pack(fill=tk.X, pady=(0, 10))
-        
+        _ctrl_wrap = tk.Frame(self.frame, bg=self.colors["panel"])
+        _ctrl_wrap.pack(fill=tk.X)
+        tk.Frame(_ctrl_wrap, width=3, bg=self.colors["accent"]).pack(side=tk.LEFT, fill=tk.Y)
+        controls = ttk.Frame(_ctrl_wrap, style="Panel.TFrame", padding=10)
+        controls.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Frame(self.frame, height=1, bg=self.colors["border"]).pack(fill=tk.X, pady=(0, 10))
+
         ttk.Label(controls, text="Log File:", style="LabelMuted.TLabel").pack(side=tk.LEFT)
         ttk.Label(controls, textvariable=self.active_log_file_var, style="TLabel").pack(side=tk.LEFT, padx=(5, 20))
         
@@ -278,7 +282,7 @@ class CombatAssistantModule(BaseModule):
              pack=True)
              
         # Add Region Labels (Append to b_card)
-        r_frame = ttk.Frame(b_card, style="App.TFrame")
+        r_frame = tk.Frame(b_card, bg=self.colors["panel"])
         r_frame.pack(fill=tk.X, pady=5)
         for key in ["ally_roster", "enemy_roster"]:
             lbl = ttk.Label(r_frame, text=f"{key.replace('_', ' ').capitalize()}: Not Set", style="LabelMuted.TLabel", font=("Consolas", 8))
@@ -295,7 +299,7 @@ class CombatAssistantModule(BaseModule):
             "Pixel monitoring of Dreadnought systems.", c_buttons, pack=True)
 
         # Add Debug Labels (Append to c_card)
-        curr_frame = ttk.Frame(c_card, style="App.TFrame")
+        curr_frame = tk.Frame(c_card, bg=self.colors["panel"])
         curr_frame.pack(fill=tk.X, pady=5)
         for key in ["cmd", "shield", "weapon"]:
             lbl = ttk.Label(curr_frame, text=f"{key.capitalize()}: -", style="LabelMuted.TLabel", font=("Consolas", 8))
@@ -409,33 +413,37 @@ class CombatAssistantModule(BaseModule):
         self._save_settings()
 
     def _build_card(self, parent, row, col, title, var, desc, buttons, pack=False):
-        card = ttk.LabelFrame(parent, text=title, style="Card.TLabelframe", padding=10)
-        # Support Packing instead of Grid for columns
+        C = self.colors
+        outer = tk.Frame(parent, bg=C["border"], padx=1, pady=1)
         if pack:
-            card.pack(fill=tk.X, pady=10, anchor="n")
+            outer.pack(fill=tk.X, pady=(0, 12), anchor="n")
         else:
-            card.grid(row=row, column=col, sticky="nw", padx=10, pady=10)
-        
-        # Use custom checkbox style via _make_checkbox
-        self._make_checkbox(card, "Enable", var, command=self._save_settings).pack(anchor="w")
-        ttk.Label(card, text=desc, style="LabelMuted.TLabel", font=("Segoe UI", 9)).pack(anchor="w", pady=5)
-        
+            outer.grid(row=row, column=col, sticky="nw", padx=10, pady=10)
+
+        tk.Frame(outer, height=3, bg=C["accent"]).pack(fill=tk.X)
+        card = tk.Frame(outer, bg=C["panel"], padx=12, pady=10)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(card, text=title, font=("Segoe UI", 10, "bold"),
+                 bg=C["panel"], fg=C["accent"]).pack(anchor=tk.W, pady=(0, 6))
+
+        self._make_checkbox(card, "Enable", var, command=self._save_settings,
+                            bg_color=C["panel"]).pack(anchor="w")
+        tk.Label(card, text=desc, font=("Segoe UI", 9),
+                 bg=C["panel"], fg=C["muted"], wraplength=260, justify=tk.LEFT).pack(anchor="w", pady=5)
+
         if buttons:
-            btn_frame = ttk.Frame(card, style="App.TFrame")
+            btn_frame = tk.Frame(card, bg=C["panel"])
             btn_frame.pack(fill=tk.X, pady=5)
-            # Refactored button layout slightly to handle 4 buttons gracefully
-            for i, (txt, cmd) in enumerate(buttons):
-                btn = ttk.Button(btn_frame, text=txt, command=cmd, style="TButton")
-                # Grid or Pack? Pack wraps badly. Grid is better if we know count.
-                # Let's simple pack with wrap in mind? Or just allow horizontal scroll?
-                # Actually, wrap frame if too many buttons.
-                btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-                
+            for txt, cmd in buttons:
+                ttk.Button(btn_frame, text=txt, command=cmd, style="TButton").pack(
+                    side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
         return card
 
     def _render_agony_ui(self, parent):
         # Frame for dynamic list
-        f = ttk.Frame(parent, style="App.TFrame")
+        f = tk.Frame(parent, bg=self.colors["panel"])
         f.pack(fill=tk.X, pady=5)
         self.agony_ui_frame = f
         
@@ -443,7 +451,7 @@ class CombatAssistantModule(BaseModule):
         self._refresh_agony_ui()
         
         # Buttons (+/-)
-        btn_frame = ttk.Frame(parent, style="App.TFrame")
+        btn_frame = tk.Frame(parent, bg=self.colors["panel"])
         btn_frame.pack(fill=tk.X, pady=2)
         
         # Use a lambda that traces the save to ensure we save when adding/removing
@@ -456,7 +464,7 @@ class CombatAssistantModule(BaseModule):
         for w in self.agony_ui_frame.winfo_children(): w.destroy()
         
         for i, var in enumerate(self.agony_users_vars):
-            row = ttk.Frame(self.agony_ui_frame, style="App.TFrame")
+            row = tk.Frame(self.agony_ui_frame, bg=self.colors["panel"])
             row.pack(fill=tk.X, pady=2)
             ttk.Label(row, text=f"User {i+2}:", style="LabelMuted.TLabel", width=8).pack(side=tk.LEFT)
             e = ttk.Entry(row, textvariable=var)

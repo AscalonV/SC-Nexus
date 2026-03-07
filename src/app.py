@@ -179,17 +179,18 @@ class App(tk.Tk):
             footer_frame = tk.Frame(tile_body, bg=TILE_BG)
             footer_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=12)
 
-            def _make_open_btn(parent, m=module, color=mod_color):
-                btn = tk.Button(parent, text="Open  →", font=("Segoe UI", 9, "bold"),
-                                bg=C["bg"], fg=color,
-                                activebackground=color, activeforeground=C["bg"],
-                                relief=tk.FLAT, bd=0, padx=10, pady=4,
-                                cursor="hand2",
-                                command=lambda mod=m: self.show_module(mod))
-                btn.pack(side=tk.RIGHT)
-                return btn
-
-            open_btn = _make_open_btn(footer_frame)
+            open_btn = None
+            if getattr(module, "has_module_view", True):
+                def _make_open_btn(parent, m=module, color=mod_color):
+                    btn = tk.Button(parent, text="Open  →", font=("Segoe UI", 9, "bold"),
+                                    bg=C["bg"], fg=color,
+                                    activebackground=color, activeforeground=C["bg"],
+                                    relief=tk.FLAT, bd=0, padx=10, pady=4,
+                                    cursor="hand2",
+                                    command=lambda mod=m: self.show_module(mod))
+                    btn.pack(side=tk.RIGHT)
+                    return btn
+                open_btn = _make_open_btn(footer_frame)
 
             cog_btn = None
             if callable(getattr(module, "open_settings", None)):
@@ -227,7 +228,8 @@ class App(tk.Tk):
                 for lbl in lf:
                     lbl.config(bg=TILE_BG_HOVER)
                 title.config(fg=C["accent_soft"])
-                o.config(bg=TILE_BG_HOVER)
+                if o:
+                    o.config(bg=TILE_BG_HOVER)
                 if cog:
                     cog.config(bg=TILE_BG_HOVER)
 
@@ -247,7 +249,8 @@ class App(tk.Tk):
                 for lbl in lf:
                     lbl.config(bg=TILE_BG)
                 title.config(fg=C["text"])
-                o.config(bg=C["bg"])
+                if o:
+                    o.config(bg=C["bg"])
                 if cog:
                     cog.config(bg=C["bg"])
 
@@ -257,7 +260,7 @@ class App(tk.Tk):
                     handled = bool(m.on_tile_click())
                 except Exception:
                     pass
-                if not handled:
+                if not handled and getattr(m, "has_module_view", True):
                     self.show_module(m)
 
             # Bind hover and click to all non-button widgets

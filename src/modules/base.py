@@ -6,6 +6,7 @@ class BaseModule(ABC):
 
     name: str
     description: str
+    has_module_view: bool = True  # Set False to hide the Open button on the launchpad tile
 
     @abstractmethod
     def build(self, parent):
