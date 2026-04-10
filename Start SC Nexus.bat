@@ -1,16 +1,10 @@
 @echo off
 cd /d "%~dp0"
-if exist ".venv\Scripts\activate.bat" (
-    call ".venv\Scripts\activate.bat"
-) else (
-    echo Virtual environment not found. Please setup the environment first.
+
+if not exist ".venv\Scripts\pythonw.exe" (
+    echo Virtual environment not found. Please run setup first.
     pause
-    exit /b
+    exit /b 1
 )
 
-python "SC Nexus.py"
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo The application crashed or exited with an error.
-    pause
-)
+start "" ".venv\Scripts\pythonw.exe" "main.py"

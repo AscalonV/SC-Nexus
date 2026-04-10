@@ -1,127 +1,139 @@
+"""
+LogTailer — QThread that streams new lines from Star Conflict's newest combat.log.
+
+Discovery
+---------
+Star Conflict creates a new dated folder (YYYY.MM.DD HH.MM.SS.mmm) per session.
+LogTailer watches the logs root directory, detects the newest folder, and tails
+its combat.log, emitting new_lines whenever fresh content arrives.
+
+Rotation is detected every *rotation_interval* seconds so that a new game session
+is picked up automatically.
+"""
+
+from __future__ import annotations
+
 import time
-import os
-import threading
 from pathlib import Path
-from typing import Callable, List, Optional
-from datetime import datetime
 
-class LogTailer:
+from PySide6.QtCore import QThread, Signal, Slot
+
+
+class LogTailer(QThread):
     """
-    Watches the logs directory for the newest 'combat.log' and streams new lines.
-    Handles log rotation (new game session starting).
+    Background thread that emits ``new_lines`` whenever combat.log grows.
+
+    Usage::
+
+        tailer = LogTailer(logs_root)
+        tailer.new_lines.connect(my_handler)
+        tailer.start()
+        ...
+        tailer.stop()
     """
-    def __init__(self, logs_root: str, callback: Callable[[List[str]], None], check_interval_ms: int = 200):
-        self.logs_root = Path(logs_root)
-        self.callback = callback
-        self.interval = check_interval_ms / 1000.0
-        self.running = False
-        self.current_file: Optional[Path] = None
-        self.line_count = 0
-        self._file_handle = None
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._last_rotation_check = 0
-        self.ROTATION_CHECK_INTERVAL = 2.0  # Check for new folders every 2 seconds
 
-    def start(self):
-        if self.running:
-            return
-        self.running = True
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="LogTailerThread")
-        self._thread.start()
+    new_lines: Signal = Signal(list)   # list[str]
 
-    def stop(self):
-        self.running = False
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        self._close_file()
+    def __init__(self, logs_root: str | Path, parent=None) -> None:
+        super().__init__(parent)
+        self._root = Path(logs_root)
+        self._running = False
+        self._read_interval    = 0.2   # seconds between line reads
+        self._rotation_interval = 2.0  # seconds between "newest-folder" checks
 
-    def update_root(self, new_root: str):
-        self.logs_root = Path(new_root)
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def _loop(self):
-        while not self._stop_event.is_set():
-            now = time.time()
-            
-            # Check for new log file (rotation)
-            if now - self._last_rotation_check > self.ROTATION_CHECK_INTERVAL:
-                self._check_for_newest_log()
-                self._last_rotation_check = now
+    @Slot(str)
+    def update_root(self, new_root: str) -> None:
+        """Change the logs root while the thread is running."""
+        self._root = Path(new_root)
 
-            # Read new lines if we have a file
-            if self._file_handle:
-                lines = self._read_new_lines()
-                if lines:
-                    try:
-                        self.callback(lines)
-                    except Exception:
-                        pass # avoid crashing thread if callback fails
+    def stop(self) -> None:
+        self._running = False
+        self.wait(3000)
 
-            time.sleep(self.interval)
+    # ------------------------------------------------------------------
+    # QThread entry point
+    # ------------------------------------------------------------------
 
-    def _check_for_newest_log(self):
-        """Find the folder with the latest timestamp name and open its combat.log"""
-        if not self.logs_root.exists():
-            return
+    def run(self) -> None:
+        self._running = True
+        current_log: Path | None = None
+        file_handle = None
+        last_rotation_check = 0.0
 
-        # Folders are named like YYYY.MM.DD HH.MM.SS.mmm usually
-        # We look for folders containing combat.log
-        candidates = []
         try:
-            for child in self.logs_root.iterdir():
-                if child.is_dir() and (child / "combat.log").exists():
-                    candidates.append(child)
+            while self._running:
+                now = time.monotonic()
+
+                # Periodic rotation check
+                if now - last_rotation_check >= self._rotation_interval:
+                    newest = self._find_newest_log()
+                    last_rotation_check = now
+
+                    if newest != current_log:
+                        had_log_before = current_log is not None
+                        # New session started — close old handle and open new one
+                        if file_handle:
+                            file_handle.close()
+                            file_handle = None
+                        current_log = newest
+                        if current_log and current_log.exists():
+                            file_handle = current_log.open(
+                                encoding="utf-8", errors="replace"
+                            )
+                            # On the first attach we skip history and let the module's
+                            # history scan decide current state. On later rotations we
+                            # must read from the start because SC often writes the
+                            # session-start lines before the next poll notices the file.
+                            if not had_log_before:
+                                file_handle.seek(0, 2)
+
+                # Read new lines from current file
+                if file_handle:
+                    lines = file_handle.readlines()
+                    if lines:
+                        self.new_lines.emit([l.rstrip("\n") for l in lines])
+
+                time.sleep(self._read_interval)
+        finally:
+            if file_handle:
+                file_handle.close()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _find_newest_log(self) -> Path | None:
+        """Return the combat.log path in the most recently created session folder."""
+        try:
+            if not self._root.exists():
+                return None
+            folders = sorted(
+                (p for p in self._root.iterdir() if p.is_dir()),
+                key=lambda p: p.name,
+            )
+            for folder in reversed(folders):
+                candidate = folder / "combat.log"
+                if candidate.exists():
+                    return candidate
         except OSError:
-            return
+            pass
+        return None
 
-        if not candidates:
-            return
-
-        # Sort by name (which acts as timestamp sort) 
-        # or mtime if names aren't reliable. SC logs usually sortable by name.
-        candidates.sort(key=lambda p: p.name, reverse=True)
-        newest_folder = candidates[0]
-        target_log = newest_folder / "combat.log"
-
-        if self.current_file != target_log:
-            # Rotation detected
-            self._switch_to_file(target_log)
-
-    def _switch_to_file(self, path: Path):
-        self._close_file()
-        try:
-            self.current_file = path
-            
-            # Count existing lines
-            try:
-                with open(path, "rb") as f:
-                    self.line_count = sum(1 for _ in f)
-            except Exception:
-                self.line_count = 0
-
-            self._file_handle = open(path, "r", encoding="utf-8", errors="ignore")
-            # Seek to end immediately so we don't parse old history on startup
-            self._file_handle.seek(0, 2) 
-        except Exception as e:
-            print(f"LogTailer error opening {path}: {e}")
-            self.current_file = None
-
-    def _close_file(self):
-        if self._file_handle:
-            try:
-                self._file_handle.close()
-            except Exception:
-                pass
-            self._file_handle = None
-
-    def _read_new_lines(self) -> List[str]:
-        if not self._file_handle:
+    def get_history_lines(self, max_lines: int = 0) -> list[str]:
+        """
+        Synchronously read lines from the current log.
+        Pass max_lines=0 (the default) to return all lines.
+        Safe to call from the main thread before start().
+        """
+        log = self._find_newest_log()
+        if not log:
             return []
         try:
-            lines = self._file_handle.readlines()
-            self.line_count += len(lines)
-            return lines
-        except Exception:
+            all_lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            return all_lines[-max_lines:] if max_lines > 0 else all_lines
+        except OSError:
             return []

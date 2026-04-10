@@ -1,1404 +1,1503 @@
-import tkinter as tk
-import os
-from tkinter import ttk, messagebox
-import time
-import re
+"""
+CombatAssistantModule — TOGGLEABLE module that provides real-time combat
+assistance via log-tailing, screen scanning, an overlay, and audio cues.
+
+Features
+--------
+* Agony buff tracker (BuffNearDeath_big) — multi-user aware
+* Torpedo wave timer (Conquest / ClanShip mode) — 58.5 s first, 65.5 s after
+* Bomb tracker — screen template matching, with a log-based fallback
+* System capture detector — pixel colour at 3 set screen points + sound alerts
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from html import escape
 import json
-import threading
+import os
 import queue
-import ctypes
+import re
+import threading
+import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import Optional
 
-from ...config import AppConfig, USER_DATA_DIR
-from ..base import BaseModule
-from ..combat_analysis.parser import (
-    AURA_APPLY_RE,
-    AURA_CANCEL_RE,
-    GAME_END_RE,
-    SESSION_START_RE,
-    DAMAGE_HEAL_RE,
-    _strip_id,
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+
+from src.core.config import AppConfig
+from src.core.module_base import ModuleBase, ModuleType
+from src.modules.combat_assistant.log_reader import LogTailer
+from src.modules.combat_assistant.scanner import ScreenScanner
+from src.modules.combat_assistant.ui.overlay import (
+    CalibrationOverlay,
+    OverlayWindow,
+    PreviewOverlay,
 )
-from .log_reader import LogTailer
-from .overlay import OverlayWindow, CalibrationOverlay
-from .scanner import ScreenScanner
+from src.modules.combat_assistant.ui.settings_view import CombatAssistantSettingsView
 
-# Sounds
-SND_BOMB = "BombPickupF.wav"
-SND_TORP = "TorpedosF.wav"
-SND_CAPT_CMD = "EnemyAtCommandTowerF.wav"
-SND_CAPT_SHIELD = "EnemyAtShieldEmitterF.wav"
-SND_CAPT_WEAPON = "EnemyAtWeaponCoolerF.wav"
+# ---- regexes replicated from parser (no circular dependency) ----------
+# Actual SC log format uses single-quoted aura/target names and includes
+# id/type fields:  Apply aura 'Name' id N type T to 'Target'
+_AURA_APPLY_RE  = re.compile(
+    r"Apply\s+aura\s+'(?P<aura>[^']+)'\s+id\s+\d+\s+type\s+\S+\s+to\s+'(?P<target>[^']+)'",
+    re.IGNORECASE,
+)
+_AURA_CANCEL_RE = re.compile(
+    r"Cancel\s+aura\s+'(?P<aura>[^']+)'\s+id\s+\d+\s+type\s+\S+\s+from\s+'(?P<target>[^']+)'",
+    re.IGNORECASE,
+)
+_SESSION_START_RE = re.compile(r"Start\s+gameplay\s+'(?P<mode>[^']+)'", re.IGNORECASE)
+_GAME_END_RE    = re.compile(r"Actual\s+game\s+time\s+[\d.]+", re.IGNORECASE)
+_DAMAGE_RE      = re.compile(r"\bDamage\b")
+_MEANINGFUL_ACTIVITY_RE = re.compile(
+    r"\b(Damage|Heal|Killed|Reward|Participant|Spawn\s+SpaceShip)\b",
+    re.IGNORECASE,
+)
 
-class CombatAssistantModule(BaseModule):
-    name = "Combat Assistant"
-    description = "Real-time combat assistance with overlays, tracking, and alerts."
+_MEANINGFUL_ACTIVITY_TIMEOUT = 10.0
 
-    def __init__(self, app, config: AppConfig):
-        self.app = app
-        self.config = config
-        self.frame: Optional[ttk.Frame] = None
-        self._scan_after_id = None
-        self._update_after_id = None
-        self.settings_file = USER_DATA_DIR / "combat_assistant_settings.json"
-        
-        # --- State ---
-        self.username_var = tk.StringVar(value=config.username)
-        self.active_log_file_var = tk.StringVar(value="Waiting for log activity...")
-        
-        # Toggles
-        self.enable_agony_var = tk.BooleanVar(value=False)
-        self.enable_overlay_var = tk.BooleanVar(value=True)
-        self.enable_bomb_var = tk.BooleanVar(value=False)
-        self.enable_torp_var = tk.BooleanVar(value=False)
-        self.enable_capture_var = tk.BooleanVar(value=False)
-        
-        # Agony State
-        self.agony_active_until = 0.0
-        self.agony_cooldown_until = 0.0
-        self.agony_is_active = False
-        
-        # Agony Multi-User Support
-        self.agony_users_vars: List[tk.StringVar] = []
-        self.agony_ui_frame: Optional[ttk.Frame] = None
-        # State: username -> {"active_until": float, "cooldown_until": float}
-        self.agony_states: Dict[str, Dict[str, float]] = {}
+# ---- Bomb constants ----------------------------------------------------
+_BOMB_FIRST_SPAWN  = 118.0   # seconds after match start until first bomb spawns
+_BOMB_RESPAWN      = 119.0   # seconds after pickup until the next bomb spawns
+_BOMB_ALLY_THRESHOLD    = 0.75  # TM_CCORR_NORMED minimum for ally bomb icon
+_BOMB_ENEMY_THRESHOLD   = 0.75  # TM_CCORR_NORMED minimum for enemy bomb icon
+_BOMB_ALLY_SQDIFF_MAX   = 0.38  # TM_SQDIFF_NORMED maximum for ally bomb icon
+_BOMB_ENEMY_SQDIFF_MAX  = 0.50  # TM_SQDIFF_NORMED maximum for enemy bomb icon
+_BOMB_ALLY_COLOR_MAX_DIST  = 90.0
+_BOMB_ENEMY_COLOR_MAX_DIST = 40.0
+_BOMB_STREAK_PICKUP = 2   # consecutive ticks with higher count to confirm pickup (~2s)
+_BOMB_STREAK_LOSS   = 6   # consecutive ticks with lower count to confirm loss (~6s)
+_BOMB_MODE_CHANGE_LOSS_GRACE = 8.0  # ignore temporary count drops right after a mode switch
 
-        # Torpedo State
-        self.torp_launch_time = 0.0
-        self.torp_next_wave = 0.0
+_BOMB_REGION_KEYS: dict[str, dict[str, str]] = {
+    "ally": {
+        "ingame":  "ally_roster_ingame",
+        "respawn": "ally_roster_respawn",
+    },
+    "enemy": {
+        "ingame":  "enemy_roster_ingame",
+        "respawn": "enemy_roster_respawn",
+    },
+}
 
-        # Bomb State
-        self.bomb_enemy_carried = False
-        self.bomb_ally_carried = False
-        self.bomb_pickup_time = 0.0
-        self.bomb_respawn_time = 0.0  # Enemy bomb respawn
-        self.bomb_ally_respawn_time = 0.0 # Ally bomb respawn
-        
-        # Bomb Stability
-        self.bomb_ally_last_seen = 0.0
-        self.bomb_enemy_last_seen = 0.0
-        self.BOMB_GRACE_PERIOD = 3.0
-        self.BOMB_CONFIRM_SECONDS = 1.0
-        self.BOMB_POSITION_TOLERANCE = 3
-        self.bomb_detection_candidates = {
-            "ally": {"pos": None, "since": 0.0},
-            "enemy": {"pos": None, "since": 0.0},
+_LEGACY_BOMB_REGION_KEYS = {
+    "ally_roster": _BOMB_REGION_KEYS["ally"]["ingame"],
+    "enemy_roster": _BOMB_REGION_KEYS["enemy"]["ingame"],
+}
+
+_ID_RE = re.compile(r"\s*\|\s*\d+\s*$")
+
+
+def _strip_id(name: str) -> str:
+    return _ID_RE.sub("", name).strip()
+
+
+# ---- sound files -------------------------------------------------------
+_SOUNDS_DIR = Path(__file__).parent / "sounds"
+SND_BOMB      = _SOUNDS_DIR / "BombPickupF.wav"
+SND_TORP      = _SOUNDS_DIR / "TorpedosF.wav"
+SND_CAPT_CMD   = _SOUNDS_DIR / "EnemyAtCommandTowerF.wav"
+SND_CAPT_SHLD  = _SOUNDS_DIR / "EnemyAtShieldEmitterF.wav"
+SND_CAPT_WPNC  = _SOUNDS_DIR / "EnemyAtWeaponCoolerF.wav"
+
+_CAPTURE_SOUNDS: dict[str, Path] = {
+    "cmd":    SND_CAPT_CMD,
+    "shield": SND_CAPT_SHLD,
+    "weapon": SND_CAPT_WPNC,
+}
+
+
+# ---------------------------------------------------------------------------
+# Pydantic settings model
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel, Field
+from src.core.config import USER_DATA_DIR
+
+
+class CombatAssistantSettings(BaseModel):
+    enabled:           bool        = False
+    overlay_x:         int         = 100
+    overlay_y:         int         = 100
+    agony_enabled:     bool        = False
+    agony_extra_users: list[str]   = Field(default_factory=list)
+    torp_enabled:      bool        = False
+    bomb_enabled:      bool        = False
+    capture_enabled:   bool        = False
+    # calibration data
+    regions:           dict[str, list[int]]  = Field(default_factory=dict)
+    points:            dict[str, list[int]]  = Field(default_factory=dict)
+
+    _path: Path = USER_DATA_DIR / "combat_assistant_settings.json"
+
+    @classmethod
+    def load(cls) -> "CombatAssistantSettings":
+        p = USER_DATA_DIR / "combat_assistant_settings.json"
+        if p.exists():
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                regions = raw.get("regions") or {}
+                if isinstance(regions, dict):
+                    for legacy_key, new_key in _LEGACY_BOMB_REGION_KEYS.items():
+                        if legacy_key in regions and new_key not in regions:
+                            regions[new_key] = regions[legacy_key]
+                    for legacy_key in _LEGACY_BOMB_REGION_KEYS:
+                        regions.pop(legacy_key, None)
+                    raw["regions"] = regions
+                return cls.model_validate(raw)
+            except Exception:
+                pass
+        return cls()
+
+    def save(self) -> None:
+        p = USER_DATA_DIR / "combat_assistant_settings.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+
+
+@dataclass
+class _BombSide:
+    """All bomb tracking state for one team (ally or enemy)."""
+    spawn_times: list[float] = field(default_factory=list)
+    available: int = 0
+    carried: int = 0               # number of bombs currently being carried
+    last_raw_count: int = -1       # raw icon count from previous tick (-1 = no scan)
+    stable_count: int = -1         # debounced/confirmed count (-1 = unknown)
+    streak: int = 0                # consecutive ticks with same raw count
+    last_scan_time: float = 0.0    # timestamp of last successful scan
+
+
+# ---------------------------------------------------------------------------
+# CombatAssistantModule
+# ---------------------------------------------------------------------------
+
+class CombatAssistantModule(ModuleBase):
+    """TOGGLEABLE — runs silently in the background when enabled."""
+
+    overlay_refresh_requested: Signal = Signal()
+
+    # ModuleBase
+    module_id    = "combat_assistant"
+    display_name = "Combat Assistant"
+    description  = "Real-time overlay: agony buff, torpedos, bomb tracker, capture alerts."
+    module_type  = ModuleType.TOGGLEABLE
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.settings.enabled
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings: CombatAssistantSettings = CombatAssistantSettings.load()
+
+        # --- Services ---
+        self._tailer:  Optional[LogTailer]    = None
+        self._overlay: Optional[OverlayWindow] = None
+        self._scanner: ScreenScanner          = ScreenScanner()
+        self._settings_view: Optional[CombatAssistantSettingsView] = None
+        self._overlay_editing = False
+
+        # --- Match state ---
+        self._match_active    = False
+        self._match_conquest  = False
+        self._last_damage_ts  = 0.0
+        self._last_meaningful_ts = 0.0
+        self._in_hangar = True
+
+        # --- Agony state (per-user) ---
+        # key: lower-cased username → {active_until, cooldown_until}
+        self._agony: dict[str, dict[str, float]] = {}
+
+        # --- Torpedo state ---
+        self._torp_launch_ts:   float = 0.0
+        self._torp_next_wave:   float = 0.0
+
+        # --- Bomb state ---
+        self._bomb_sides: dict[str, _BombSide] = {
+            "ally":  _BombSide(),
+            "enemy": _BombSide(),
         }
+        self._bomb_debug_enabled = True
+        self._bomb_debug_log_path = USER_DATA_DIR / "combat_assistant_bomb_debug.log"
+        self._bomb_debug_images = False
+        self._bomb_debug_frames_dir = USER_DATA_DIR / "_bomb_debug_frames"
+        self._map_ref_image: object = None  # numpy array or None; loaded lazily
+        self._bomb_map_open: bool | None = None  # cached per-tick result
+        self._map_mode_cache: str = "ingame"  # hysteresis: last confident screen mode
+        self._bomb_mode_changed_at: float = 0.0
 
-        # Create Scan Lock
-        self.scan_lock = threading.Lock()
-        
-        # Capture State (Timestamps of last sound play to throttle)
-        self.last_capture_sound: Dict[str, float] = {}
-        self.capture_start_times: Dict[str, float] = {} # Track when white color started
+        # --- Capture state ---
+        self._capture_white_since: dict[str, float] = {}
+        self._capture_last_sound:  dict[str, float] = {}
+        self._capture_pixel_debug: dict[str, tuple] = {}
 
-        # Visibility Logic
-        self.master_overlay_enabled = tk.BooleanVar(value=True) # User switch
-        self.match_active_signal = False # Match start/end
-        self.last_damage_time = 0.0 # Combat activity
-        self._is_visible = False # Actual state
-        
-        # Backward compatibility for existing settings
-        self.enable_overlay_var = self.master_overlay_enabled
+        # --- Scan lock (prevents overlap between QTimer ticks) ---
+        self._scan_lock = threading.Lock()
+        self._scan_running = False
 
-        # Sound Queue
-        self.sound_queue = queue.Queue()
-        self._sound_thread = threading.Thread(target=self._sound_worker, daemon=True)
-        self._sound_thread.start()
-
-        # Overlay Position Defaults
-        self.overlay_x = 100
-        self.overlay_y = 100
-
-        # Settings (Regions/Points)
-        self.regions: Dict[str, Tuple[int,int,int,int]] = {}  # "ally_roster", "enemy_roster"
-        self.points: Dict[str, Tuple[int,int]] = {} # "cmd", "shield", "weapon"
-        self._load_settings()
-
-        # Services
-        self.tailer: Optional[LogTailer] = None
-        self.overlay: Optional[OverlayWindow] = None
-        self.scanner = ScreenScanner() 
-        self._scan_thread: Optional[threading.Thread] = None
-        
-        # Assets
-        self.assets_path = Path(__file__).parent / "assets"
-        # Load assets in background
-        def _load_assets():
-            self.scanner.load_template("bomb_ally", self.assets_path / "Allied bomb logo.png")
-            self.scanner.load_template("bomb_enemy", self.assets_path / "Enemy bomb logo.png")
-        threading.Thread(target=_load_assets, daemon=True).start()
-
-        # Focus State Tracking
-        self._last_focus_state = None  # None, "game", or "other"
-
-        # Match State
-        self.match_is_conquest = False
-
-        # Theme Colors (Matched to Combat Analysis)
-        self.colors = {
-            "bg": "#0b1224",
-            "panel": "#111b33",
-            "surface": "#16213f",
-            "border": "#24365c",
-            "accent": "#3de7ff",
-            "accent_soft": "#7be8ff",
-            "accent_dark": "#1b4f73",
-            "text": "#e9f3ff",
-            "muted": "#9bb3d6",
-        }
-        self.checkbox_imgs = {}
-
-        # UI Elements
-        self.agony_label: Optional[tk.Label] = None
-        self.torp_label: Optional[tk.Label] = None
-        self.bomb_ally_label: Optional[tk.Label] = None
-        self.bomb_enemy_label: Optional[tk.Label] = None
-        self.overlay_editing = False
-        self.overlay_btn_text: Optional[tk.StringVar] = None
-        
-        self.debug_labels = {}
-        self.region_labels = {}
-        
-        # Init Theme Resources
-        self._ensure_check_images()
-
-    def _ensure_check_images(self) -> None:
-        if self.checkbox_imgs:
-            return
-        panel = self.colors["panel"]
-        border = self.colors["border"]
-        fill = self.colors["surface"]
-
-        def make(on: bool) -> tk.PhotoImage:
-            img = tk.PhotoImage(width=16, height=16)
-            # Base fill skipped to allow transparency (shows button bg)
-            # Inner box
-            img.put(fill, to=(2, 2, 14, 14))
-            # Border
-            for x in range(0, 16):
-                img.put(border, to=(x, 0))
-                img.put(border, to=(x, 15))
-            for y in range(0, 16):
-                img.put(border, to=(0, y))
-                img.put(border, to=(15, y))
-            if on:
-                # Simple X mark - White
-                white = "#ffffff"
-                for i in range(4, 12):
-                    img.put(white, to=(i, i))
-                    img.put(white, to=(i, 15 - i))
-                    img.put(white, to=(i, i + 1))
-                    img.put(white, to=(i, 14 - i))
-            return img
-            
-        self.checkbox_imgs["off"] = make(False)
-        self.checkbox_imgs["on"] = make(True)
-
-    def _make_checkbox(self, parent, text: str, var: tk.Variable, command=None, bg_color=None) -> tk.Checkbutton:
-        # Matches CombatAnalysisModule style
-        if bg_color is None:
-            bg_color = self.colors["panel"]
-            
-        chk = tk.Checkbutton(
-            parent,
-            text=text,
-            variable=var,
-            command=command,
-            image=self.checkbox_imgs["off"],
-            selectimage=self.checkbox_imgs["on"],
-            compound="left",
-            onvalue=True,
-            offvalue=False,
-            indicatoron=False,
-            bd=0,
-            relief="flat",
-            highlightthickness=0,
-            padx=4,
-            pady=2,
-            anchor="w",
-            bg=bg_color,
-            fg=self.colors["text"],
-            activebackground=bg_color,
-            activeforeground=self.colors["text"],
-            selectcolor=bg_color,
-            font=("Segoe UI", 9)
+        # --- Sound queue (daemon thread; plays sequentially) ---
+        self._snd_queue: queue.Queue[Path] = queue.Queue()
+        self._snd_thread = threading.Thread(
+            target=self._sound_worker, daemon=True, name="snd-worker"
         )
-        return chk
+        self._snd_thread.start()
 
-    def build(self, parent):
-        self.frame = ttk.Frame(parent, style="App.TFrame")
+        # --- QTimer for periodic scan (1 s) ---
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(1000)
+        self._scan_timer.timeout.connect(self._on_tick)
+        self.overlay_refresh_requested.connect(self._update_overlay)
 
-        # --- Header ---
-        _ctrl_wrap = tk.Frame(self.frame, bg=self.colors["panel"])
-        _ctrl_wrap.pack(fill=tk.X)
-        tk.Frame(_ctrl_wrap, width=3, bg=self.colors["accent"]).pack(side=tk.LEFT, fill=tk.Y)
-        controls = ttk.Frame(_ctrl_wrap, style="Panel.TFrame", padding=10)
-        controls.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tk.Frame(self.frame, height=1, bg=self.colors["border"]).pack(fill=tk.X, pady=(0, 10))
+        # --- CalibrationOverlay reference (only one can be open) ---
+        self._calib_overlay: Optional[CalibrationOverlay] = None
+        self._preview_overlay: Optional[PreviewOverlay] = None
 
-        ttk.Label(controls, text="Log File:", style="LabelMuted.TLabel").pack(side=tk.LEFT)
-        ttk.Label(controls, textvariable=self.active_log_file_var, style="TLabel").pack(side=tk.LEFT, padx=(5, 20))
-        
-        ttk.Button(controls, text="Edit Overlay Pos", command=self._toggle_overlay_edit, style="TButton").pack(side=tk.RIGHT)
-        
-        self.overlay_btn_text = tk.StringVar(value=f"Overlay Master: {'ON' if self.master_overlay_enabled.get() else 'OFF'}")
-        ttk.Button(controls, textvariable=self.overlay_btn_text, command=self._toggle_overlay_vis, style="TButton").pack(side=tk.RIGHT, padx=5)
+    # ------------------------------------------------------------------
+    # ModuleBase interface
+    # ------------------------------------------------------------------
 
-        # --- Grid ---
-        grid = ttk.Frame(self.frame, style="App.TFrame")
-        grid.pack(fill=tk.BOTH, expand=True, padx=20)
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-        # Two columns: Conquest, PvP
+    def initialize(self, config: AppConfig) -> None:
+        self._config = config
+        status = "Enabled" if self.settings.enabled else "Disabled"
+        self.status_changed.emit(status)
+        if self.settings.enabled:
+            self._start()
 
-        # --- Group 1: Conquest ---
-        # "Conquest: containing: Torpedo Timer, Bomb Tracker and System Capture"
-        self.conquest_enabled = tk.BooleanVar(value=True)
-        # We need a proper container that looks like a group.
-        # But user wants "parts" to be in columns.
-        
-        col_conq = ttk.Frame(grid, style="App.TFrame")
-        col_conq.grid(row=0, column=0, sticky="nsew", padx=10)
-        
-        # Header for Group
-        h_conq = ttk.Frame(col_conq, style="App.TFrame")
-        h_conq.pack(fill=tk.X, pady=(0, 5))
-        self._make_checkbox(h_conq, "Conquest", self.conquest_enabled, 
-            command=lambda: self._toggle_group("conquest"), bg_color=self.colors["bg"]).pack(side=tk.LEFT)
-        
-        # 1. Torpedoes (Inside Conquest)
-        self._build_card(col_conq, 0, 0, "Torpedo Timer", self.enable_torp_var,
-            "Tracks 'Spell_ClanShipTorpedo'.\nWave every 65.5s.", None, pack=True)
+    def shutdown(self) -> None:
+        self._stop()
 
-        # 2. Bomb Tracker
-        b_card = self._build_card(col_conq, 0, 0, "Bomb Tracker", self.enable_bomb_var,
-            "Visual tracking of bomb icons.\nRequires setup of team areas.",
-            [("Set Ally Area", lambda: self._calibrate_region("ally_roster")),
-             ("Set Enemy Area", lambda: self._calibrate_region("enemy_roster")),
-             ("Show Areas", self._preview_regions)], # Added show areas button
-             pack=True)
-             
-        # Add Region Labels (Append to b_card)
-        r_frame = tk.Frame(b_card, bg=self.colors["panel"])
-        r_frame.pack(fill=tk.X, pady=5)
-        for key in ["ally_roster", "enemy_roster"]:
-            lbl = ttk.Label(r_frame, text=f"{key.replace('_', ' ').capitalize()}: Not Set", style="LabelMuted.TLabel", font=("Consolas", 8))
-            lbl.pack(anchor="w")
-            self.region_labels[key] = lbl
+    def on_config_changed(self, config: AppConfig) -> None:
+        self._config = config
+        if self._tailer is not None:
+            self._tailer.update_root(config.logs_path)
 
-        # 3. System Capture
-        c_buttons = [("Set Command", lambda: self._calibrate_point("cmd")),
-             ("Set Shield", lambda: self._calibrate_point("shield")),
-             ("Set Weapon", lambda: self._calibrate_point("weapon")),
-             ("Show Points", self._preview_points)] # Added show points button
-             
-        c_card = self._build_card(col_conq, 0, 0, "System Capture", self.enable_capture_var,
-            "Pixel monitoring of Dreadnought systems.", c_buttons, pack=True)
+    def on_toggle(self, enabled: bool) -> None:
+        self.settings.enabled = enabled
+        self.settings.save()
+        if enabled:
+            self._start()
+        else:
+            self._stop()
+        self.status_changed.emit("Enabled" if enabled else "Disabled")
+        # Keep settings view in sync
+        if self._settings_view:
+            self._settings_view.sync_master(enabled)
 
-        # Add Debug Labels (Append to c_card)
-        curr_frame = tk.Frame(c_card, bg=self.colors["panel"])
-        curr_frame.pack(fill=tk.X, pady=5)
-        for key in ["cmd", "shield", "weapon"]:
-            lbl = ttk.Label(curr_frame, text=f"{key.capitalize()}: -", style="LabelMuted.TLabel", font=("Consolas", 8))
-            lbl.pack(anchor="w")
-            self.debug_labels[key] = lbl
-            
-        # Initial UI Update
-        self._update_region_labels()
-        self._apply_debug_labels({})
+    def build_settings_panel(self, parent: QWidget) -> QWidget:
+        view = CombatAssistantSettingsView(self, parent)
+        self._settings_view = view
+        view.master_toggled.connect(self._on_settings_toggle)
+        return view
 
+    # ------------------------------------------------------------------
+    # Start / Stop
+    # ------------------------------------------------------------------
 
-        # --- Group 2: PvP ---
-        # "PvP: containing: Agony buff"
-        self.pvp_enabled = tk.BooleanVar(value=True)
-        col_pvp = ttk.Frame(grid, style="App.TFrame")
-        col_pvp.grid(row=0, column=1, sticky="nsew", padx=10)
-
-        h_pvp = ttk.Frame(col_pvp, style="App.TFrame")
-        h_pvp.pack(fill=tk.X, pady=(0, 5))
-        self._make_checkbox(h_pvp, "PvP", self.pvp_enabled,
-            command=lambda: self._toggle_group("pvp"), bg_color=self.colors["bg"]).pack(side=tk.LEFT)
-
-        # 1. Agony
-        agony_card = self._build_card(col_pvp, 0, 0, "Agony Buff", self.enable_agony_var, 
-            "Tracks 'BuffNearDeath_big'.\nActive: 12s | CD: 25s",
-            None, pack=True)
-        self._render_agony_ui(agony_card)
-
-        # Initialize Overlay
-        if not self.overlay:
-            self.overlay = OverlayWindow(self.app, x=self.overlay_x, y=self.overlay_y, on_move=self._on_overlay_move)
-            self.overlay.set_target_position(self.overlay_x, self.overlay_y, apply=True)
-            self._build_overlay_content()
-            self._update_overlay_visibility()
-            # Try to force a geometry update or resize hint if on different DPI?
-            # self.overlay.update()
-            # self.overlay.geometry(f"+{self.overlay_x}+{self.overlay_y}")
-
-        # Services
-        if not self.tailer:
-            self.tailer = LogTailer(self.config.logs_path, self._on_log_lines)
-            self.tailer.start()
-            
-        self._schedule_update()
-        self._schedule_scan()
-        
-        # New Logic: Check current log file backwards for active match state
-        # Delay slightly to ensure tailer has found file
-        self.app.after(1000, self._check_match_state_from_log)
-
-        return self.frame
-    
-    def _check_match_state_from_log(self):
-        """
-        Reads the current log file backwards to determine if we are in a match.
-        Locates the last 'Start gameplay' or 'GAME END' event.
-        """
-        if not self.tailer or not self.tailer.current_file or not self.tailer.current_file.exists():
-            # Retry if file not ready yet
-            self.app.after(2000, self._check_match_state_from_log)
+    def _start(self) -> None:
+        """Start tailer, load assets, show overlay, start scan timer."""
+        config = getattr(self, "_config", None)
+        if config is None:
             return
 
-        try:
-            path = self.tailer.current_file
-            is_conquest = False
-
-            # Read a tail chunk (5 MB) to find the most recent boundary event.
-            file_size = os.path.getsize(path)
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                seek_pos = max(0, file_size - 5 * 1024 * 1024)
-                f.seek(seek_pos)
-                lines = f.readlines()
-
-                for line in reversed(lines):
-                    # First boundary wins because we traverse from latest to oldest.
-                    if (
-                        GAME_END_RE.search(line)
-                        or "Gameplay finished" in line
-                        or "Session finished" in line
-                        or "Quit application" in line
-                    ):
-                        self.match_active_signal = False
-                        self.match_is_conquest = False
-                        self.last_damage_time = 0.0
-                        self._update_visibility_logic()
-                        return
-
-                    m_start = SESSION_START_RE.search(line)
-                    if m_start or "Start gameplay" in line:
-                        # Infer conquest from mode or explicit ClanShip marker.
-                        mode = m_start.group("mode") if m_start else ""
-                        is_conquest = "'ClanShip'" in line or mode == "ClanShip"
-
-                        print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Active match found in history!")
-                        self.match_active_signal = True
-                        self.match_is_conquest = is_conquest
-                        self.last_damage_time = time.time()
-                        self._update_visibility_logic()
-                        return
-        except Exception as e:
-            print(f"Error checking log history: {e}")
-
-    def _toggle_group(self, group):
-        state = self.conquest_enabled.get() if group == "conquest" else self.pvp_enabled.get()
-        if group == "conquest":
-            self.enable_torp_var.set(state)
-            self.enable_bomb_var.set(state)
-            self.enable_capture_var.set(state)
+        # Log tailer
+        if self._tailer is None:
+            self._tailer = LogTailer(config.logs_path)
+            self._tailer.new_lines.connect(self._process_lines)
         else:
-            self.enable_agony_var.set(state)
-        self._save_settings()
+            self._tailer.update_root(config.logs_path)
+        if not self._tailer.isRunning():
+            self._tailer.start()
 
-    def _build_card(self, parent, row, col, title, var, desc, buttons, pack=False):
-        C = self.colors
-        outer = tk.Frame(parent, bg=C["border"], padx=1, pady=1)
-        if pack:
-            outer.pack(fill=tk.X, pady=(0, 12), anchor="n")
-        else:
-            outer.grid(row=row, column=col, sticky="nw", padx=10, pady=10)
+        # Template assets
+        assets = Path(__file__).parent / "assets"
+        def _load():
+            enemy_path = assets / "Enemy bomb logo.png"
+            ally_path = assets / "Allied bomb logo.png"
+            self._rebuild_ally_bomb_template_from_enemy(enemy_path, ally_path)
+            self._scanner.load_template("bomb_enemy", enemy_path)
+            self._scanner.load_template("bomb_ally", ally_path)
+        threading.Thread(target=_load, daemon=True).start()
 
-        tk.Frame(outer, height=3, bg=C["accent"]).pack(fill=tk.X)
-        card = tk.Frame(outer, bg=C["panel"], padx=12, pady=10)
-        card.pack(fill=tk.BOTH, expand=True)
+        # Overlay
+        if self._overlay is None:
+            self._build_overlay()
+        self._overlay.move_to_physical(self.settings.overlay_x, self.settings.overlay_y)
+        self._overlay.set_edit_mode(self._overlay_editing)
+        self._update_overlay()
 
-        tk.Label(card, text=title, font=("Segoe UI", 10, "bold"),
-                 bg=C["panel"], fg=C["accent"]).pack(anchor=tk.W, pady=(0, 6))
+        # Scan timer
+        self._scan_timer.start()
 
-        self._make_checkbox(card, "Enable", var, command=self._save_settings,
-                            bg_color=C["panel"]).pack(anchor="w")
-        tk.Label(card, text=desc, font=("Segoe UI", 9),
-                 bg=C["panel"], fg=C["muted"], wraplength=260, justify=tk.LEFT).pack(anchor="w", pady=5)
+        # History scan
+        QTimer.singleShot(1200, self._check_match_from_history)
 
-        if buttons:
-            btn_frame = tk.Frame(card, bg=C["panel"])
-            btn_frame.pack(fill=tk.X, pady=5)
-            for txt, cmd in buttons:
-                ttk.Button(btn_frame, text=txt, command=cmd, style="TButton").pack(
-                    side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+    def _stop(self) -> None:
+        self._scan_timer.stop()
+        if self._tailer:
+            self._tailer.stop()
+            self._tailer = None
+        if self._overlay:
+            self._overlay_editing = False
+            self._overlay.set_edit_mode(False)
+            self._overlay.hide()
+        self._sync_overlay_edit_state()
 
-        return card
+    # ------------------------------------------------------------------
+    # Overlay construction
+    # ------------------------------------------------------------------
 
-    def _render_agony_ui(self, parent):
-        # Frame for dynamic list
-        f = tk.Frame(parent, bg=self.colors["panel"])
-        f.pack(fill=tk.X, pady=5)
-        self.agony_ui_frame = f
-        
-        # Render existing
-        self._refresh_agony_ui()
-        
-        # Buttons (+/-)
-        btn_frame = tk.Frame(parent, bg=self.colors["panel"])
-        btn_frame.pack(fill=tk.X, pady=2)
-        
-        # Use a lambda that traces the save to ensure we save when adding/removing
-        ttk.Button(btn_frame, text="+", command=self._add_agony_tracker, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="-", command=self._remove_agony_tracker, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Label(btn_frame, text="Add Usernames", style="LabelMuted.TLabel").pack(side=tk.LEFT, padx=5)
+    def _build_overlay(self) -> None:
+        from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
 
-    def _refresh_agony_ui(self):
-        if not self.agony_ui_frame: return
-        for w in self.agony_ui_frame.winfo_children(): w.destroy()
-        
-        for i, var in enumerate(self.agony_users_vars):
-            row = tk.Frame(self.agony_ui_frame, bg=self.colors["panel"])
-            row.pack(fill=tk.X, pady=2)
-            ttk.Label(row, text=f"User {i+2}:", style="LabelMuted.TLabel", width=8).pack(side=tk.LEFT)
-            e = ttk.Entry(row, textvariable=var)
-            e.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            # Bind focus out to save? Or rely on explicit save elsewhere?
-            # Since vars are bound, _save_settings reads them. 
-            # But we need to trigger save when they type?
-            # Usually we use a trace or binding.
-            var.trace_add("write", lambda *args: self._save_settings())
+        self._overlay = OverlayWindow()
+        self._overlay.position_changed.connect(self._on_overlay_moved)
 
-    def _add_agony_tracker(self):
-        self.agony_users_vars.append(tk.StringVar(value=""))
-        self._refresh_agony_ui()
-        self._save_settings()
+        self._ov_left_col = QWidget(self._overlay)
+        self._ov_left_col.setStyleSheet("background: transparent;")
+        self._ov_right_col = QWidget(self._overlay)
+        self._ov_right_col.setStyleSheet("background: transparent;")
 
-    def _remove_agony_tracker(self):
-        if self.agony_users_vars:
-            self.agony_users_vars.pop()
-            self._refresh_agony_ui()
-            self._save_settings()
+        # Inner layout — labels populated each tick
+        self._ov_agony_lbl  = QLabel(self._ov_left_col)
+        self._ov_torp_lbl   = QLabel(self._ov_right_col)
+        self._ov_b_ally_lbl = QLabel(self._ov_right_col)
+        self._ov_b_ene_lbl  = QLabel(self._ov_right_col)
 
-    def on_show(self):
-        if self.tailer:
-            self.tailer.update_root(self.config.logs_path)
-            self.tailer.start()
+        base_style = "color: white; font: bold 10pt 'Consolas'; background: transparent;"
+        for lbl in (
+            self._ov_agony_lbl,
+            self._ov_torp_lbl,
+            self._ov_b_ally_lbl,
+            self._ov_b_ene_lbl,
+        ):
+            lbl.setStyleSheet(base_style)
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            lbl.hide()
 
-    def on_hide(self):
-        if self._scan_after_id:
-            self.app.after_cancel(self._scan_after_id)
-            self._scan_after_id = None
-        
-        if self._update_after_id:
-            self.app.after_cancel(self._update_after_id)
-            self._update_after_id = None
-        
-        self._save_settings()
-        
-        if self.tailer:
-            self.tailer.stop()
+        left_lay = QVBoxLayout(self._ov_left_col)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(2)
+        left_lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        left_lay.addWidget(self._ov_agony_lbl)
 
-        if self.overlay:
-            self.overlay.destroy()
-            self.overlay = None
+        right_lay = QVBoxLayout(self._ov_right_col)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(2)
+        right_lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        right_lay.addWidget(self._ov_torp_lbl)
+        right_lay.addWidget(self._ov_b_ally_lbl)
+        right_lay.addWidget(self._ov_b_ene_lbl)
 
-    # --- Log Processing ---
-    def _on_log_lines(self, lines: List[str]):
-        self.app.after(0, self._process_lines, lines)
+        lay = QGridLayout(self._overlay)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setHorizontalSpacing(16)
+        lay.setVerticalSpacing(8)
+        lay.addWidget(
+            self._ov_left_col,
+            0,
+            0,
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+        )
+        self._overlay.set_edit_mode(self._overlay_editing)
 
-    def _process_lines(self, lines: List[str]):
-        if self.tailer and self.tailer.current_file:
-            # Include folder name and line count
-            # Folder/Filename (Line X)
-            folder = self.tailer.current_file.parent.name
-            fname = self.tailer.current_file.name
-            lc = self.tailer.line_count
-            self.active_log_file_var.set(f"{folder}/{fname} (Line {lc})")
-            
-        current_username = self.config.username.lower()
-        now = time.time()
-        
-        # Check for damage activity to keep overlay alive
-        for line in lines:
-            # Avoid Hangar activity triggering the overlay
-            if "Hangar" in line:
-                continue
+    @staticmethod
+    def _format_overlay_rows(
+        rows: list[tuple[str, str, str]],
+        *,
+        min_name_width: int = 0,
+        min_status_width: int = 0,
+        gap_spaces: int = 2,
+    ) -> str:
+        if not rows:
+            return ""
 
-            if DAMAGE_HEAL_RE.search(line):
-                self.last_damage_time = now
-                self._update_visibility_logic()
+        name_width = max(max(len(name) for name, _, _ in rows), min_name_width)
+        status_width = max(max(len(status) for _, status, _ in rows), min_status_width)
+        html_rows: list[str] = []
+        for name, status, color in rows:
+            padded_name = escape(name.ljust(name_width)).replace(" ", "&nbsp;")
+            padded_status = escape(status.ljust(status_width)).replace(" ", "&nbsp;")
+            separator = "&nbsp;" * gap_spaces
+            html_rows.append(
+                "<div style='white-space:pre; margin:0; padding:0; line-height:1.2;'>"
+                f"<span style='color:white;'>{padded_name}</span>"
+                + separator
+                +
+                f"<span style='color:{color};'>{padded_status}</span>"
+                "</div>"
+            )
 
-        for line in lines:
-            # Match Start / Game Session Start
-            # Reset/Start timers
-            # User update: check for "Start gameplay"
-            if "Start gameplay" in line:
-                self.match_active_signal = True
-                self.last_damage_time = now  # Treat match start as activity to avoid delayed show
-                
-                # Check for Conquest Mode (ClanShip)
-                if "'ClanShip'" in line:
-                    self.match_is_conquest = True
-                    print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Conquest Mode Detected (ClanShip)")
-                else:
-                    self.match_is_conquest = False
-                
-                self._update_visibility_logic()
-                
-                # User request: "Start timers for torpedos (norm interval) and both bombs (2 min)"
-                # Modified: "reduce initial timer by 7s (torp) and 2s (bomb)"
-                self.torp_launch_time = now
-                self.torp_next_wave = now + 58.5 # 65.5 - 7
-                
-                # Both bombs spawn 2 min after start
-                # Modified: "reduce by 2s" -> 118s
-                self.bomb_respawn_time = now + 118.0
-                self.bomb_ally_respawn_time = now + 118.0
-                
-                # Reset visual states
-                self.bomb_enemy_carried = False
-                self.bomb_ally_carried = False
-                self.bomb_detection_candidates = {
-                    "ally": {"pos": None, "since": 0.0},
-                    "enemy": {"pos": None, "since": 0.0},
-                }
-                
-            # Match End
-            if (
-                GAME_END_RE.search(line)
-                or "Gameplay finished" in line
-                or "Session finished" in line
-                or "Quit application" in line
-            ):
-                self.match_active_signal = False
-                self.match_is_conquest = False # Reset
-                self.agony_active_until = 0.0
-                self.agony_cooldown_until = 0.0
-                self.last_damage_time = 0.0
-                
-                # Reset Conquest timers
-                self.torp_launch_time = 0.0
-                self.torp_next_wave = 0.0
-                self.bomb_respawn_time = 0.0
-                self.bomb_ally_respawn_time = 0.0
-                self.bomb_enemy_carried = False
-                self.bomb_ally_carried = False
-                self.bomb_detection_candidates = {
-                    "ally": {"pos": None, "since": 0.0},
-                    "enemy": {"pos": None, "since": 0.0},
-                }
-                
-                self._update_visibility_logic()
+        return "".join(html_rows)
 
-            # Agony
-            if self.enable_agony_var.get():
-                m_apply = AURA_APPLY_RE.search(line) 
-                
-                if m_apply and m_apply.group("aura") == "BuffNearDeath_big":
-                    target = _strip_id(m_apply.group("target")).lower()
-                    
-                    # 1. Check Main
-                    if current_username and target == current_username:
-                        self.agony_active_until = now + 12.0
-                        self.agony_cooldown_until = now + 25.0
-                    
-                    # 2. Check Extras
-                    for v in self.agony_users_vars:
-                         val = v.get().strip()
-                         if val and val.lower() == target:
-                             self.agony_states[target] = {
-                                 "active_until": now + 12.0,
-                                 "cooldown_until": now + 25.0,
-                                 "name": val
-                             }
+    # ------------------------------------------------------------------
+    # Bomb helpers (new name-hash based tracker)
+    # ------------------------------------------------------------------
 
-                m_cancel = AURA_CANCEL_RE.search(line)
-                if m_cancel and m_cancel.group("aura") == "BuffNearDeath_big":
-                    target = _strip_id(m_cancel.group("target")).lower()
-                    
-                    if current_username and target == current_username:
-                        self.agony_active_until = 0.0
-                        
-                    if target in self.agony_states:
-                        self.agony_states[target]["active_until"] = 0.0
-
-            # Torpedoes
-            if self.enable_torp_var.get():
-                # Fix: Check for specific Cast event to avoid matching "Apply aura" or "Cancel aura" logic
-                # which can happen seconds later and reset the timer.
-                if "Spell 'Spell_ClanShipTorpedo'" in line:
-                    # Debounce: Only set if last launch was > 15s ago
-                    if (now - self.torp_launch_time) > 15.0: 
-                        self.torp_launch_time = now
-                        self.torp_next_wave = now + 65.5
-                        self.last_damage_time = now
-                        self._update_visibility_logic()
-                        self._play_sound(SND_TORP)
-                
-            # Bomb (Log Fallback)
-            if self.enable_bomb_var.get():
-                # Check for various pick up messages
-                # "Bomb taken by [Player]"
-                # "Bomb dropped by [Player]"
-                # "Bomb reset"
-                # The user says "The bomb detection does not work".
-                # If visuals fail, we rely on logs.
-                # Common strings:
-                # "The bomb has been taken by..." ?
-                # "Bomb taken" ?
-                # Let's try broader:
-                if "Bomb" in line:
-                    lower_line = line.lower()
-                    if "taken" in lower_line or "picked up" in lower_line:
-                        # Assuming enemy if we don't check name match yet
-                        # But wait, if WE pick it up, we want Ally Carried.
-                        # If THEY pick it up, we want Enemy Carried.
-                        # "taken by <name>"
-                        self._play_sound(SND_BOMB)
-                        
-                        # Determine team by name? 
-                        # Hard without roster list.
-                        # Simplified: Just set BOTH timers/warnings?? No.
-                        # User said "bomb detection does not work" with visuals.
-                        # Let's just trigger the timer reset whenever "taken".
-                        # This at least gives a timer.
-                        self.bomb_respawn_time = now + 120.0
-                        self.bomb_ally_respawn_time = now + 120.0
-                        
-                        # Heuristic: If detecting player name logic was here...
-                        # For now, just show CARRIED for Enemy as default "Panic" mode?
-                        self.bomb_enemy_carried = True
-                    elif "reset" in lower_line or "returned" in lower_line:
-                        # Bomb returned
-                        self.bomb_enemy_carried = False
-                        self.bomb_ally_carried = False
-
-    # --- Scanning & Visuals ---
-    def _update_focus_debug(self):
-        """Checks focus state and prints debug info only if state changes."""
+    def _bomb_debug(self, side: str, message: str) -> None:
+        if not self._bomb_debug_enabled:
+            return
+        line = f"[{time.strftime('%H:%M:%S')}] [BOMB][{side.upper()}] {message}"
+        print(line)
         try:
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            if hwnd == 0:
-                current_state = "unknown"
-                current_window = "None"
-            else:
-                length = 256
-                buff = ctypes.create_unicode_buffer(length)
-                ctypes.windll.user32.GetClassNameW(hwnd, buff, length)
-                current_window = buff.value
-                
-                if current_window == "game_main_window":
-                    current_state = "game"
-                else:
-                    current_state = "other"
-            
-            # Print only on transition
-            if self._last_focus_state != current_state:
-                ts = time.strftime('%H:%M:%S')
-                if current_state == "game":
-                    print(f"[{ts}] [DEBUG] Game window FOCUSED ({current_window})")
-                elif current_state == "other":
-                     print(f"[{ts}] [DEBUG] Focus LOST. Current window: '{current_window}'")
-                elif current_state == "unknown":
-                     print(f"[{ts}] [DEBUG] Focus Unknown.")
-                
-                self._last_focus_state = current_state
-                
+            USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with self._bomb_debug_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
         except Exception:
             pass
 
-    def _schedule_scan(self):
-        # Update focus debug regularly (outside thread to avoid print race conditions, though simple print is atomic enough)
-        self._update_focus_debug()
+    def _reset_bomb_state(self, *, now: float | None = None, match_start: bool = False) -> None:
+        now = time.time() if now is None else now
+        if match_start:
+            try:
+                USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                self._bomb_debug_log_path.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+        for side, state in self._bomb_sides.items():
+            state.spawn_times = [now + _BOMB_FIRST_SPAWN] if match_start else []
+            state.available = 0
+            state.carried = 0
+            state.last_raw_count = -1
+            state.stable_count = -1
+            state.streak = 0
+            state.last_scan_time = 0.0
+            self._bomb_debug(
+                side,
+                f"reset match_start={match_start} spawn_times={[max(0, int(t - now)) for t in state.spawn_times]}",
+            )
+        self._map_mode_cache = "ingame"
+        self._bomb_mode_changed_at = now
 
-        # We start a thread to run the scan logic, checking first if one is already running
-        # This prevents UI Lag
-        if not self.frame: return
-        
-        if self._scan_thread is None or not self._scan_thread.is_alive():
-            # Capture variables in main thread (Tcl is not thread safe)
-            bomb_on = self.enable_bomb_var.get()
-            capture_on = self.enable_capture_var.get()
-            
-            self._scan_thread = threading.Thread(target=self._run_scan_thread, args=(bomb_on, capture_on), daemon=True)
-            self._scan_thread.start()
-            
-        # Re-schedule check for thread completion or next run
-        self._scan_after_id = self.app.after(500, self._schedule_scan)
+    def _bootstrap_bomb_from_history(self, now: float) -> None:
+        for side, state in self._bomb_sides.items():
+            if state.available or state.spawn_times or state.carried:
+                continue
+            state.available = 1
+            self._bomb_debug(side, "history bootstrap: assuming bomb available")
 
-    def _run_scan_thread(self, bomb_on, capture_on):
-        # Heavy lifting here
-        try:
-            with self.scan_lock:
-                 # Logic for features
-                 if bomb_on:
-                    self._scan_bombs()
-                
-                 if capture_on:
-                     self._scan_capture()
-                 else:
-                     # Even if capture logic is disabled, if we have points set, we might want to update the debug labels 
-                     # (show just coordinates) or do a passive scan?
-                     # User asked for "detected color" to be displayed.
-                     # If disabled, maybe we should still read the pixel ONLY for the UI if points are set?
-                     # Let's check points.
-                     if self.points:
-                         # Minimal scan just for UI
-                         debug_vals = {}
-                         for name in ["cmd", "shield", "weapon"]:
-                             if name in self.points:
-                                 debug_vals[name] = self.scanner.get_pixel_color(*self.points[name])
-                         self.app.after(0, self._apply_debug_labels, debug_vals)
-        except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Error in scan thread: {e}")
+    # ------------------------------------------------------------------
+    # Map/respawn screen detection
+    # ------------------------------------------------------------------
 
-    def _update_capture_debug(self):
-        # This runs on main thread, quick check of LAST known values?
-        # Or re-read? Re-reading is slow.
-        # Let's just do the reading in the thread and pass data?
-        # For now, simplistic: _update_capture_debug does the reading.
-        # If user says window is lagging, we must move `get_pixel_color` calls too.
-        
-        # Let's move the logic into the thread, update SELF state, then here update UI.
-        pass # Refactored into thread logic mostly
-        
-        # Quick hack: Only update debug labels if visible (user looking at settings)
-        # But for now, let's keep it simple. If we move `_update_capture_debug` blindly it might still lag.
-        # The main culprit is template matching loop (Python).
-        
-        # Refactoring `_update_capture_debug` to merely refresh UI if we can cache values.
-        # Scanner cache?
-        # Let's just read pixels in thread.
-        pass
+    _MAP_REF_IMAGE_PATH = USER_DATA_DIR / "map_detect_reference.png"
+    _MAP_DETECT_THRESHOLD = 0.80  # similarity above which we say "map is open"
 
-    def _has_multiple_bomb_icons(self, positions, min_distance: int = 10) -> bool:
-        if not positions or len(positions) < 2:
-            return False
-        for i in range(len(positions)):
-            for j in range(i + 1, len(positions)):
-                dx = abs(positions[i][0] - positions[j][0])
-                dy = abs(positions[i][1] - positions[j][1])
-                if max(dx, dy) >= min_distance:
-                    return True
-        return False
-
-    def _is_near_position(self, pos_a, pos_b, tolerance: int) -> bool:
-        if not pos_a or not pos_b:
-            return False
-        return abs(pos_a[0] - pos_b[0]) <= tolerance and abs(pos_a[1] - pos_b[1]) <= tolerance
-
-    def _scan_bombs(self):
-        # Runs in Thread
-        
-        # Only scan if we are reliably in a match to avoid lobby/hangar false positives
-        if not self.match_active_signal:
+    def _load_map_ref_image(self) -> None:
+        """Load the saved reference image from disk (once)."""
+        if self._map_ref_image is not None:
             return
-            
-        now = time.time()
+        p = self._MAP_REF_IMAGE_PATH
+        if p.exists():
+            try:
+                import cv2
+                img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+                if img is not None:
+                    self._map_ref_image = img
+            except Exception:
+                pass
 
-        def process_bomb(side: str, region_key: str, template_name: str, threshold: int, carried_attr: str, last_seen_attr: str, respawn_attr: str, play_sound: bool = False):
-            if region_key not in self.regions:
-                if int(now) % 10 == 0:
-                    print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] '{region_key}' region not set, skipping {side} scan.")
+    def _save_map_ref_image(self, img: "np.ndarray") -> None:
+        """Save a reference image to disk and cache it."""
+        try:
+            import cv2
+            self._MAP_REF_IMAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(self._MAP_REF_IMAGE_PATH), img)
+            self._map_ref_image = img
+        except Exception:
+            pass
+
+    def _is_map_open(self) -> bool | None:
+        """Check if the map/respawn screen is currently showing.
+
+        Uses hysteresis to avoid oscillating between modes during
+        screen transitions.  High similarity (≥ 0.80) → respawn,
+        low similarity (≤ 0.20) → ingame.  In between, reuse the
+        last confident result.
+
+        Returns True if respawn/map, False if ingame, None if not calibrated.
+        """
+        region_vals = self.settings.regions.get("map_detect")
+        if not region_vals or len(region_vals) != 4:
+            return None
+        self._load_map_ref_image()
+        if self._map_ref_image is None:
+            return None
+        region = tuple(region_vals)
+        current = self._scanner.capture_region_image(region)
+        if current is None:
+            return None
+        similarity = ScreenScanner.compare_images(self._map_ref_image, current)
+
+        # Hysteresis thresholds
+        if similarity >= 0.80:
+            new_mode = "respawn"
+        elif similarity <= 0.20:
+            new_mode = "ingame"
+        else:
+            # Uncertain — keep previous mode
+            new_mode = self._map_mode_cache
+
+        if new_mode != self._map_mode_cache:
+            self._bomb_debug("map", f"mode change {self._map_mode_cache}→{new_mode} sim={similarity:.3f}")
+            self._map_mode_cache = new_mode
+            self._bomb_mode_changed_at = time.time()
+
+        self._bomb_debug("map", f"similarity={similarity:.3f} mode={self._map_mode_cache}")
+        return self._map_mode_cache == "respawn"
+
+    def _count_bomb_icons(self, side: str) -> tuple[int, list[tuple[int, int, float]], tuple[float, float]]:
+        """Count bomb icons in the appropriate roster region.
+
+        Uses the map-detect reference with hysteresis to determine which
+        screen is active (ingame vs respawn).  If not calibrated, tries both.
+
+        Returns (count, positions, best_scores).
+        """
+        template = f"bomb_{side}"
+        threshold = _BOMB_ALLY_THRESHOLD if side == "ally" else _BOMB_ENEMY_THRESHOLD
+        sqdiff_max = _BOMB_ALLY_SQDIFF_MAX if side == "ally" else _BOMB_ENEMY_SQDIFF_MAX
+        color_max_dist = _BOMB_ALLY_COLOR_MAX_DIST if side == "ally" else _BOMB_ENEMY_COLOR_MAX_DIST
+        debug_dir = self._bomb_debug_frames_dir if self._bomb_debug_images else None
+
+        # Determine which screen modes to scan
+        map_open = self._bomb_map_open
+        if map_open is True:
+            modes_to_scan = ("respawn",)
+        elif map_open is False:
+            modes_to_scan = ("ingame",)
+        else:
+            modes_to_scan = ("ingame", "respawn")
+
+        total_count = 0
+        all_positions: list[tuple[int, int, float]] = []
+        best_ccorr = -1.0
+        best_sqdiff = -1.0
+
+        for screen_mode in modes_to_scan:
+            region_key = _BOMB_REGION_KEYS[side][screen_mode]
+            region_vals = self.settings.regions.get(region_key)
+            if not region_vals or len(region_vals) != 4:
+                continue
+            region = tuple(region_vals)
+            count, positions, scores = self._scanner.count_bomb_icons(
+                template, region, threshold=threshold, sqdiff_max=sqdiff_max,
+                color_max_dist=color_max_dist, debug_dir=debug_dir,
+                debug_tag=f"{side}_{screen_mode}",
+            )
+            total_count += count
+            all_positions.extend(positions)
+            if scores[0] > best_ccorr:
+                best_ccorr = scores[0]
+            if best_sqdiff < 0 or (scores[1] >= 0 and scores[1] < best_sqdiff):
+                best_sqdiff = scores[1]
+
+        return (total_count, all_positions, (best_ccorr, best_sqdiff))
+
+    def _layout_overlay_columns(
+        self,
+        agony_visible: bool,
+        multi_mode: bool,
+        conquest_visible: bool,
+    ) -> None:
+        if self._overlay is None:
+            return
+
+        lay = self._overlay.layout()
+        if lay is None:
+            return
+
+        lay.removeWidget(self._ov_left_col)
+        lay.removeWidget(self._ov_right_col)
+        lay.addWidget(
+            self._ov_left_col,
+            0,
+            0,
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+        )
+        self._ov_left_col.setVisible(agony_visible)
+
+        if conquest_visible:
+            if multi_mode:
+                lay.addWidget(
+                    self._ov_right_col,
+                    0,
+                    1,
+                    Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+                )
+            else:
+                lay.addWidget(
+                    self._ov_right_col,
+                    1,
+                    0,
+                    Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+                )
+            self._ov_right_col.show()
+        else:
+            self._ov_right_col.hide()
+
+    def _on_overlay_moved(self, px: int, py: int) -> None:
+        self.settings.overlay_x = px
+        self.settings.overlay_y = py
+        self.settings.save()
+
+    def _sync_overlay_edit_state(self) -> None:
+        if self._settings_view:
+            self._settings_view.refresh_overlay_edit_button(self._overlay_editing)
+
+    def request_overlay_refresh(self) -> None:
+        self.overlay_refresh_requested.emit()
+
+    def _has_recent_meaningful_activity(self, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return (now - self._last_meaningful_ts) < _MEANINGFUL_ACTIVITY_TIMEOUT
+
+    def _mark_meaningful_activity(self, now: float) -> None:
+        self._last_damage_ts = now
+        self._last_meaningful_ts = now
+        self._in_hangar = False
+
+    def _update_overlay_visibility(self, content_visible: bool) -> None:
+        if self._overlay is None:
+            return
+
+        if self._overlay_editing:
+            if not self._overlay.isVisible():
+                self._overlay.show()
+            return
+
+        recent_meaningful = self._has_recent_meaningful_activity()
+        should_show = (
+            self.settings.enabled
+            and self._match_active
+            and content_visible
+            and self._is_game_foreground()
+            and recent_meaningful
+            and not self._in_hangar
+        )
+
+        if should_show:
+            self._overlay.move_to_physical(self.settings.overlay_x, self.settings.overlay_y)
+            if not self._overlay.isVisible():
+                self._overlay.show()
+        elif self._overlay.isVisible():
+            self._overlay.hide()
+
+    # ------------------------------------------------------------------
+    # Settings toggle (from settings view master checkbox)
+    # ------------------------------------------------------------------
+
+    @Slot(bool)
+    def _on_settings_toggle(self, enabled: bool) -> None:
+        # settings_view already saved; just sync the internal state
+        if enabled != self.settings.enabled:
+            self.on_toggle(enabled)
+
+    # ------------------------------------------------------------------
+    # Periodic tick (500 ms)
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_tick(self) -> None:
+        # Offload heavy scanning to a thread; update overlay in this thread after
+        if self._scan_running:
+            return
+
+        now = time.time()
+        bomb_on    = self.settings.bomb_enabled
+        capture_on = self.settings.capture_enabled
+        recent_meaningful = self._has_recent_meaningful_activity(now=now)
+
+        if self._match_active and not self._overlay_editing and not recent_meaningful:
+            self._capture_white_since.clear()
+            self.request_overlay_refresh()
+            return
+
+        if not (bomb_on and self._match_active) and not (capture_on or self.settings.points):
+            self.request_overlay_refresh()
+            return
+
+        self._scan_running = True
+
+        def _work():
+            try:
+                if bomb_on and self._match_active and self._is_game_foreground():
+                    self._scan_bombs()
+                if capture_on or self.settings.points:
+                    self._scan_capture(capture_on)
+            finally:
+                self._scan_running = False
+                self.request_overlay_refresh()
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Log processing
+    # ------------------------------------------------------------------
+
+    @Slot(list)
+    def _process_lines(self, lines: list[str]) -> None:
+        now = time.time()
+        username = getattr(self, "_config", None)
+        username = (username.username if username else "").lower()
+        overlay_needs_refresh = False
+
+        for line in lines:
+            if "Hangar" in line:
+                self._in_hangar = True
+                overlay_needs_refresh = True
+
+            # Activity heartbeat (filter out hangar noise)
+            if "Hangar" not in line and _MEANINGFUL_ACTIVITY_RE.search(line):
+                self._mark_meaningful_activity(now)
+
+            # ---- Match boundaries ----------------------------------------
+            if "Start gameplay" in line:
+                self._match_active    = True
+                self._mark_meaningful_activity(now)
+                m = _SESSION_START_RE.search(line)
+                self._match_conquest  = (
+                    "'ClanShip'" in line or (m and m.group("mode") == "ClanShip")
+                )
+                self._bomb_debug("ally", f"match start detected conquest={self._match_conquest}")
+                self._bomb_debug("enemy", f"match start detected conquest={self._match_conquest}")
+                # Torpedo — first wave shortened by 7 s
+                self._torp_launch_ts  = now
+                self._torp_next_wave  = now + 58.5
+                self._reset_bomb_state(now=now, match_start=True)
+                overlay_needs_refresh = True
+
+            if _GAME_END_RE.search(line) or any(
+                t in line for t in ("Gameplay finished", "Session finished", "Quit application")
+            ):
+                self._match_active    = False
+                self._match_conquest  = False
+                self._last_damage_ts  = 0.0
+                self._last_meaningful_ts = 0.0
+                self._in_hangar = True
+                self._agony           = {}
+                self._torp_launch_ts  = 0.0
+                self._torp_next_wave  = 0.0
+                self._bomb_debug("ally", "match end detected; clearing state")
+                self._bomb_debug("enemy", "match end detected; clearing state")
+                self._reset_bomb_state(now=now, match_start=False)
+                overlay_needs_refresh = True
+
+            # ---- Agony ---------------------------------------------------
+            if self.settings.agony_enabled:
+                m = _AURA_APPLY_RE.search(line)
+                if m and m.group("aura") == "BuffNearDeath_big":
+                    target = _strip_id(m.group("target")).lower()
+                    if target and (target == username or target in [
+                        u.lower() for u in [username] + self.settings.agony_extra_users
+                    ]):
+                        self._mark_meaningful_activity(now)
+                        self._agony[target] = {
+                            "active_until":   now + 12.0,
+                            "cooldown_until": now + 25.0,
+                        }
+                        overlay_needs_refresh = True
+
+                m = _AURA_CANCEL_RE.search(line)
+                if m and m.group("aura") == "BuffNearDeath_big":
+                    target = _strip_id(m.group("target")).lower()
+                    if target in self._agony:
+                        self._mark_meaningful_activity(now)
+                        self._agony[target]["active_until"] = 0.0
+                        overlay_needs_refresh = True
+
+            # ---- Torpedoes -----------------------------------------------
+            if self.settings.torp_enabled and "Spell 'Spell_ClanShipTorpedo'" in line:
+                if (now - self._torp_launch_ts) > 15.0:
+                    self._mark_meaningful_activity(now)
+                    self._torp_launch_ts = now
+                    self._torp_next_wave = now + 65.5
+                    self._play_sound(SND_TORP)
+                    overlay_needs_refresh = True
+
+        if overlay_needs_refresh:
+            self.request_overlay_refresh()
+
+    # ------------------------------------------------------------------
+    # History scan (detect if match was already in progress on startup)
+    # ------------------------------------------------------------------
+
+    def _check_match_from_history(self) -> None:
+        if self._tailer is None:
+            return
+        lines = self._tailer.get_history_lines()
+        now = time.time()
+        for line in reversed(lines):
+            if _GAME_END_RE.search(line) or any(
+                t in line for t in ("Gameplay finished", "Session finished", "Quit application")
+            ):
+                return  # match ended before we started
+            m = _SESSION_START_RE.search(line)
+            if m or "Start gameplay" in line:
+                self._match_active   = True
+                self._mark_meaningful_activity(now)
+                self._match_conquest = "'ClanShip'" in line or (m and m.group("mode") == "ClanShip")
+                if self._match_conquest:
+                    self._bootstrap_bomb_from_history(now)
                 return
 
-            matches = self.scanner.find_template(
-                self.regions[region_key],
-                template_name,
-                threshold=threshold,
-                return_positions=True,
-                max_results=3,
-            ) or []
+    # ------------------------------------------------------------------
+    # Bomb scanning (runs on worker thread)
+    # ------------------------------------------------------------------
 
-            carried = getattr(self, carried_attr)
-            respawn_time = getattr(self, respawn_attr)
-            last_seen = getattr(self, last_seen_attr)
-            candidate = self.bomb_detection_candidates.get(side, {"pos": None, "since": 0.0})
-            candidate_pos = candidate.get("pos")
-            candidate_since = candidate.get("since", 0.0)
+    def _scan_bombs(self) -> None:
+        """Count-based bomb tracker with asymmetric debouncing.
 
-            def _save_candidate(pos, since):
-                self.bomb_detection_candidates[side] = {"pos": pos, "since": since}
-
-            if matches:
-                observed_pos = None
-                if candidate_pos:
-                    best = min(matches, key=lambda m: abs(m[0] - candidate_pos[0]) + abs(m[1] - candidate_pos[1]))
-                    if self._is_near_position((best[0], best[1]), candidate_pos, self.BOMB_POSITION_TOLERANCE * 2):
-                        observed_pos = (best[0], best[1])
-                if observed_pos is None:
-                    observed_pos = (matches[0][0], matches[0][1])
-
-                if not carried:
-                    if candidate_pos is None:
-                        _save_candidate(observed_pos, now)
-                    elif self._is_near_position(observed_pos, candidate_pos, self.BOMB_POSITION_TOLERANCE):
-                        _save_candidate(observed_pos, candidate_since)
-                        if (now - candidate_since) >= self.BOMB_CONFIRM_SECONDS:
-                            try:
-                                debug_str = []
-                                for m in matches:
-                                    val = m[2]
-                                    if val <= 1.0:
-                                        debug_str.append(f"({m[0]}, {m[1]}) conf={val*100:.1f}%")
-                                    else:
-                                        debug_str.append(f"({m[0]}, {m[1]}) diff={val:.1f}")
-                                details = ", ".join(debug_str)
-                            except Exception:
-                                details = str(matches)
-                            print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Bomb {side.upper()} confirmed after {self.BOMB_CONFIRM_SECONDS:.1f}s. Matches: {details}")
-
-                            setattr(self, carried_attr, True)
-                            setattr(self, last_seen_attr, now)
-
-                            timer_active = now < respawn_time
-                            if not timer_active:
-                                setattr(self, respawn_attr, now + 120.0)
-                                if play_sound:
-                                    self._play_sound(SND_BOMB)
-                    else:
-                        _save_candidate(observed_pos, now)
-                else:
-                    setattr(self, last_seen_attr, now)
-                    _save_candidate(observed_pos, now)
-
-                    timer_active = now < respawn_time
-                    has_two_icons = self._has_multiple_bomb_icons(matches)
-
-                    if not timer_active and has_two_icons:
-                        setattr(self, respawn_attr, now + 120.0)
-                        if play_sound:
-                            self._play_sound(SND_BOMB)
-            else:
-                _save_candidate(None, 0.0)
-                if (now - last_seen) > self.BOMB_GRACE_PERIOD:
-                    if carried:
-                        print(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Bomb {side.upper()} lost (grace period expired)")
-                    setattr(self, carried_attr, False)
-
-        process_bomb("ally", "ally_roster", "bomb_ally", 0.95, "bomb_ally_carried", "bomb_ally_last_seen", "bomb_ally_respawn_time", False)
-        process_bomb("enemy", "enemy_roster", "bomb_enemy", 0.95, "bomb_enemy_carried", "bomb_enemy_last_seen", "bomb_respawn_time", True)
-
-    def _scan_capture(self):
-        # Runs in Thread
-        # Check points for color change (Blue -> White/Gray)
-        # Assuming Team Blue is friendly defaults. Capture means turning from Blue to White (neutralizing) or Red.
-        
-        debug_vals = {}
+        Each tick:
+        1. Process due spawn timers.
+        2. Count bomb icons via template matching.
+        3. Debounce: require _BOMB_STREAK_PICKUP consecutive ticks for
+           count increase, _BOMB_STREAK_LOSS for decrease.
+        4. On stable count change, update carried/available and schedule
+           respawn timers.
+        """
         now = time.time()
-        
-        for name, snd in [("cmd", SND_CAPT_CMD), ("shield", SND_CAPT_SHIELD), ("weapon", SND_CAPT_WEAPON)]:
-            if name in self.points:
-                pixel = self.scanner.get_pixel_color(*self.points[name])
-                debug_vals[name] = pixel
-                
-                # Check if "White-ish" - High RGB
-                # Or check if significantly different from "Normal Blue"
-                # Simple heuristic: r > 200 and g > 200 and b > 200 (White)
-                if pixel[0] > 200 and pixel[1] > 200 and pixel[2] > 200:
-                    # White detected. Start timer if not running.
-                    if name not in self.capture_start_times:
-                        self.capture_start_times[name] = now
-                    
-                    # Check 2s Duration
-                    if (now - self.capture_start_times[name]) >= 2.0:
-                        # Trigger sound logic (cooldown handled inside _trigger_capture_sound)
-                        self.app.after(0, self._trigger_capture_sound, name, snd)
-                else:
-                    # Not white - reset timer
-                    if name in self.capture_start_times:
-                        del self.capture_start_times[name]
-                    
-        # Update Debug UI safely
-        self.app.after(0, self._apply_debug_labels, debug_vals)
 
-    def _apply_debug_labels(self, vals):
-        # Check global error state
-        if self.scanner.last_error:
-             lbl = self.debug_labels.get("cmd") # Hijack first label
-             if lbl:
-                 # ttk.Label does not support fg.
-                 lbl.config(text=f"Error: {self.scanner.last_error}")
-             return
+        # Detect screen mode once per tick (shared across ally/enemy)
+        self._bomb_map_open = self._is_map_open()
+        mode_changed_recently = (now - self._bomb_mode_changed_at) < _BOMB_MODE_CHANGE_LOSS_GRACE
 
-        for key, lbl in self.debug_labels.items():
-            if key in self.points:
-                 x, y = self.points[key]
-                 if key in vals:
-                     # Detected color available
-                     r, g, b = vals[key]
-                     lbl.config(text=f"{key.capitalize()}: ({x}, {y}) - RGB({r}, {g}, {b})")
-                 else:
-                     # Coordinates set, but not scanning/active
-                     lbl.config(text=f"{key.capitalize()}: ({x}, {y}) - Disabled/Not Scanning")
+        for side, state in self._bomb_sides.items():
+            # 1. Process due spawn timers --------------------------------
+            due = [t for t in state.spawn_times if t <= now]
+            if due:
+                state.spawn_times = [t for t in state.spawn_times if t > now]
+                state.available += len(due)
+                self._bomb_debug(
+                    side,
+                    f"spawn timer(s) fired count={len(due)} available={state.available} "
+                    f"pending={len(state.spawn_times)}",
+                )
+
+            # 2. Count bomb icons ----------------------------------------
+            raw_count, positions, best_scores = self._count_bomb_icons(side)
+            effective_raw_count = raw_count
+            if (
+                mode_changed_recently
+                and state.stable_count >= 0
+                and raw_count < state.stable_count
+            ):
+                effective_raw_count = state.stable_count
+                self._bomb_debug(
+                    side,
+                    f"suppressing loss during mode grace raw={raw_count} stable={state.stable_count} "
+                    f"mode={self._map_mode_cache}",
+                )
+
+            # 3. Debounce with asymmetric streaks ------------------------
+            if effective_raw_count == state.last_raw_count:
+                state.streak += 1
             else:
-                lbl.config(text=f"{key.capitalize()}: Not Set")
+                state.streak = 1
+                state.last_raw_count = effective_raw_count
 
-    def _update_region_labels(self):
-        for key, lbl in self.region_labels.items():
-            if key in self.regions:
-                r = self.regions[key]
-                # rect: left, top, width, height
-                lbl.config(text=f"{key.replace('_', ' ').capitalize()}: ({r[0]}, {r[1]}) {r[2]}x{r[3]}")
+            # Determine required streak based on direction
+            if state.stable_count < 0:
+                # First scan — accept immediately
+                needed = 1
+            elif effective_raw_count > state.stable_count:
+                needed = _BOMB_STREAK_PICKUP  # fast for pickups
+            elif effective_raw_count < state.stable_count:
+                needed = _BOMB_STREAK_LOSS    # slow for losses
             else:
-                lbl.config(text=f"{key.replace('_', ' ').capitalize()}: Not Set")
+                needed = 1  # same count, always stable
 
-    def _trigger_capture_sound(self, name, filename):
+            prev_stable = state.stable_count
+
+            if state.streak >= needed:
+                state.stable_count = effective_raw_count
+
+            state.last_scan_time = now
+
+            # 4. React to stable count changes ---------------------------
+            if state.stable_count != prev_stable and prev_stable >= 0:
+                delta = state.stable_count - prev_stable
+                if delta > 0:
+                    # New pickup(s)
+                    state.carried += delta
+                    state.available = max(0, state.available - delta)
+                    for _ in range(delta):
+                        state.spawn_times.append(now + _BOMB_RESPAWN)
+                    state.spawn_times.sort()
+                    if side == "enemy":
+                        self._play_sound(SND_BOMB)
+                    self._mark_meaningful_activity(now)
+                    self._bomb_debug(
+                        side,
+                        f"pickup delta={delta} carried={state.carried} "
+                        f"available={state.available} pending={len(state.spawn_times)}",
+                    )
+                elif delta < 0:
+                    # Carrier(s) lost bomb
+                    lost = abs(delta)
+                    state.carried = max(0, state.carried - lost)
+                    self._bomb_debug(
+                        side,
+                        f"loss delta={delta} carried={state.carried} "
+                        f"available={state.available}",
+                    )
+
+            # 5. Tick summary for debug ----------------------------------
+            pending = [max(0, int(t - now)) for t in sorted(state.spawn_times)]
+            self._bomb_debug(
+                side,
+                f"tick raw={raw_count} effective={effective_raw_count} stable={state.stable_count} streak={state.streak} "
+                f"carried={state.carried} available={state.available} pending={pending} "
+                f"ccorr={best_scores[0]:.3f} sqdiff={best_scores[1]:.3f} "
+                f"mode={self._map_mode_cache}",
+            )
+
+    # ------------------------------------------------------------------
+    # Capture scanning (runs on worker thread)
+    # ------------------------------------------------------------------
+
+    def _scan_capture(self, active: bool) -> None:
         now = time.time()
-        # Per-system cooldown check
-        last = self.last_capture_sound.get(name, 0)
-        if now - last > 20.0: # 20s cooldown
-            self._play_sound(filename)
-            self.last_capture_sound[name] = now
+        debug: dict[str, tuple] = {}
 
-    def _is_game_foreground(self) -> bool:
-        """Checks if the game window is currently in the foreground."""
-        try:
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            if hwnd == 0:
-                return False
-            
-            length = 256
-            buff = ctypes.create_unicode_buffer(length)
-            ctypes.windll.user32.GetClassNameW(hwnd, buff, length)
-            current_class = buff.value
-            
-            # Check for Star Conflict window class "game_main_window"
-            is_game = (current_class == "game_main_window")
-            
-            return is_game
-        except Exception:
-            return False
+        for name, snd_path in _CAPTURE_SOUNDS.items():
+            pt = self.settings.points.get(name)
+            if not pt:
+                continue
+            pixel = self._scanner.get_pixel_color(pt[0], pt[1])
+            debug[name] = pixel
 
-    def _sound_worker(self):
+            if not active:
+                continue
+
+            r, g, b = pixel
+            is_white = r > 200 and g > 200 and b > 200
+            if is_white:
+                if name not in self._capture_white_since:
+                    self._capture_white_since[name] = now
+                elif (now - self._capture_white_since[name]) >= 2.0:
+                    last = self._capture_last_sound.get(name, 0.0)
+                    if (now - last) > 20.0:
+                        self._play_sound(snd_path)
+                        self._capture_last_sound[name] = now
+            else:
+                self._capture_white_since.pop(name, None)
+
+        self._capture_pixel_debug = debug
+
+    # ------------------------------------------------------------------
+    # Overlay update (always on Qt main thread via QTimer.singleShot)
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _update_overlay(self) -> None:
+        if self._overlay is None:
+            return
+
+        now = time.time()
+        any_visible = False
+        agony_visible = False
+        conquest_visible = False
+        multi_mode = False
+
+        # ---- Agony ---------------------------------------------------
+        if self.settings.agony_enabled and self._match_active:
+            cfg = getattr(self, "_config", None)
+            tracked_users: list[tuple[str, str]] = []
+            seen_users: set[str] = set()
+
+            username = (cfg.username if cfg else "").strip()
+            if username:
+                tracked_users.append((username, username.lower()))
+                seen_users.add(username.lower())
+            else:
+                tracked_users.append(("Self", ""))
+
+            for raw_name in self.settings.agony_extra_users:
+                display_name = raw_name.strip()
+                if not display_name:
+                    continue
+                lookup_name = display_name.lower()
+                if lookup_name in seen_users:
+                    continue
+                tracked_users.append((display_name, lookup_name))
+                seen_users.add(lookup_name)
+
+            multi_mode = len(tracked_users) > 1
+
+            lines: list[str] = []
+            for display_name, lookup_name in tracked_users:
+                state = self._agony.get(lookup_name, {}) if lookup_name else {}
+                act   = state.get("active_until",   0.0)
+                cd    = state.get("cooldown_until",  0.0)
+                if now < act:
+                    color = "#ffff33"
+                    status = f"ACTIVE {int(act - now)} s"
+                elif now < cd:
+                    color = "#ff3333"
+                    status = f"CD {int(cd - now)} s"
+                else:
+                    color = "#33ff33"
+                    status = "READY"
+                lines.append((display_name, status, color))
+            self._ov_agony_lbl.setText(
+                self._format_overlay_rows(lines, min_status_width=12, gap_spaces=1)
+            )
+            self._ov_agony_lbl.setTextFormat(
+                __import__("PySide6.QtCore", fromlist=["Qt"]).Qt.TextFormat.RichText
+            )
+            self._ov_agony_lbl.show()
+            agony_visible = True
+            any_visible = True
+        else:
+            self._ov_agony_lbl.hide()
+
+        conquest_rows: list[tuple[str, str, str]] = []
+
+        # ---- Torpedoes -----------------------------------------------
+        if self.settings.torp_enabled and self._match_conquest:
+            conquest_visible = True
+            if now < self._torp_next_wave:
+                rem = int(self._torp_next_wave - now)
+                conquest_rows.append(("Torpedos", f"{rem} s", "#ff8800"))
+            else:
+                conquest_rows.append(("Torpedos", "READY", "#33ff33"))
+
+        # ---- Bombs ---------------------------------------------------
+        if self.settings.bomb_enabled and self._match_conquest:
+            conquest_visible = True
+            for side, tag in (("ally", "Allied Bomb"), ("enemy", "Enemy Bomb")):
+                state = self._bomb_sides[side]
+                if state.available > 0:
+                    conquest_rows.append((tag, "READY", "#33ff33"))
+                elif state.spawn_times:
+                    rem = max(0, int(min(state.spawn_times) - now))
+                    conquest_rows.append((tag, f"{rem} s", "#ff3333"))
+                else:
+                    conquest_rows.append((tag, "...", "#9bb3d6"))
+
+        if conquest_rows:
+            self._ov_torp_lbl.setText(
+                self._format_overlay_rows(conquest_rows, min_name_width=11, min_status_width=7)
+            )
+            self._ov_torp_lbl.setTextFormat(
+                __import__("PySide6.QtCore", fromlist=["Qt"]).Qt.TextFormat.RichText
+            )
+            self._ov_torp_lbl.show()
+            any_visible = True
+        else:
+            self._ov_torp_lbl.hide()
+
+        self._ov_b_ally_lbl.hide()
+        self._ov_b_ene_lbl.hide()
+
+        self._layout_overlay_columns(agony_visible, multi_mode, conquest_visible)
+        layout = self._overlay.layout()
+        if layout is not None:
+            layout.activate()
+        self._overlay.adjustSize()
+        self._update_overlay_visibility(any_visible)
+
+    # ------------------------------------------------------------------
+    # Sound
+    # ------------------------------------------------------------------
+
+    def _play_sound(self, path: Path) -> None:
+        if path.exists():
+            self._snd_queue.put(path)
+
+    def _sound_worker(self) -> None:
+        import ctypes
         while True:
-            path_str = self.sound_queue.get()
+            path = self._snd_queue.get()
             try:
-                # Only play if game is focused
+                # Only play when Star Conflict is in the foreground
                 if self._is_game_foreground():
                     import winsound
-                    # SND_SYNC blocks, ensuring sequential playback
-                    winsound.PlaySound(path_str, winsound.SND_SYNC | winsound.SND_FILENAME)
+                    winsound.PlaySound(str(path), winsound.SND_SYNC | winsound.SND_FILENAME)
             except Exception:
                 pass
             finally:
-                self.sound_queue.task_done()
+                self._snd_queue.task_done()
 
-    def _play_sound(self, filename: str):
-        path = Path(__file__).parent / "sounds" / filename
-        if path.exists():
-            self.sound_queue.put(str(path))
+    @staticmethod
+    def _is_game_foreground() -> bool:
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if hwnd == 0:
+                return False
+            class_buf = ctypes.create_unicode_buffer(256)
+            title_buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetClassNameW(hwnd, class_buf, 256)
+            ctypes.windll.user32.GetWindowTextW(hwnd, title_buf, 256)
+            class_name = class_buf.value.strip()
+            title = title_buf.value.strip().lower()
+            return class_name == "game_main_window" or "star conflict" in title
+        except Exception:
+            return False
 
-    # --- Overlay & UI ---
-    def _schedule_update(self):
-        if not self.frame: return
-        
-        self._update_visibility_logic()
-        self._update_overlay_ui()
-        self._update_after_id = self.app.after(100, self._schedule_update)
+    # ------------------------------------------------------------------
+    # Calibration helpers (called from settings view)
+    # ------------------------------------------------------------------
 
-    def _update_visibility_logic(self):
-        # Force show if editing
-        if self.overlay_editing:
-             if self.overlay:
-                 if not self._is_visible:
-                     self.overlay.show()
-                     self._is_visible = True
-             return
+    def calibrate_region(self, key: str) -> None:
+        """Open fullscreen CalibrationOverlay for region selection."""
+        if self._calib_overlay is not None:
+            return  # already open
+        cal = CalibrationOverlay()
+        self._calib_overlay = cal
 
-        # Master Switch Check
-        if not self.master_overlay_enabled.get():
-             if self._is_visible:
-                 self.overlay.hide() if self.overlay else None
-                 self._is_visible = False
-             return
+        def _on_region(x, y, w, h):
+            self.settings.regions[key] = [x, y, w, h]
+            self.settings.save()
+            if self._settings_view:
+                self._settings_view.refresh_regions()
+            _cleanup()
 
-        # If no match is active, keep overlay hidden to avoid flicker after match end.
-        if not self.match_active_signal:
-            if self._is_visible and self.overlay:
-                self.overlay.hide()
-            self._is_visible = False
+        def _cleanup():
+            self._calib_overlay = None
+
+        cal.region_selected.connect(_on_region)
+        cal.region_selected.connect(lambda *_: cal.deleteLater())
+        cal.cancelled.connect(_cleanup)
+        cal.destroyed.connect(_cleanup)
+        cal.start_region()
+
+    def calibrate_point(self, key: str) -> None:
+        """Open fullscreen CalibrationOverlay for single-point selection."""
+        if self._calib_overlay is not None:
+            return
+        cal = CalibrationOverlay()
+        self._calib_overlay = cal
+
+        def _on_point(x, y):
+            self.settings.points[key] = [x, y]
+            self.settings.save()
+            if self._settings_view:
+                self._settings_view.refresh_points()
+            _cleanup()
+
+        def _cleanup():
+            self._calib_overlay = None
+
+        cal.point_selected.connect(_on_point)
+        cal.point_selected.connect(lambda *_: cal.deleteLater())
+        cal.cancelled.connect(_cleanup)
+        cal.destroyed.connect(_cleanup)
+        cal.start_point()
+
+    def calibrate_map_reference(self) -> None:
+        """Calibrate the map-detect region: user drags an area over the X button
+        on the map/respawn screen, then a reference screenshot is immediately
+        captured and saved."""
+        if self._calib_overlay is not None:
+            return
+        cal = CalibrationOverlay()
+        self._calib_overlay = cal
+
+        def _on_region(x, y, w, h):
+            self.settings.regions["map_detect"] = [x, y, w, h]
+            self.settings.save()
+            # Immediately capture and save the reference image
+            region = (x, y, w, h)
+            img = self._scanner.capture_region_image(region)
+            if img is not None:
+                self._save_map_ref_image(img)
+            if self._settings_view:
+                self._settings_view.refresh_regions()
+            _cleanup()
+
+        def _cleanup():
+            self._calib_overlay = None
+
+        cal.region_selected.connect(_on_region)
+        cal.region_selected.connect(lambda *_: cal.deleteLater())
+        cal.cancelled.connect(_cleanup)
+        cal.destroyed.connect(_cleanup)
+        cal.start_region()
+
+    def preview_regions(self) -> None:
+        """Briefly show a fullscreen overlay that marks calibrated regions."""
+        if not self.settings.regions:
+            return
+        overlay = PreviewOverlay(regions=self.settings.regions)
+        self._preview_overlay = overlay
+        overlay.destroyed.connect(lambda *_: setattr(self, "_preview_overlay", None))
+        overlay.show_preview()
+
+    def preview_points(self) -> None:
+        if not self.settings.points:
+            return
+        overlay = PreviewOverlay(points=self.settings.points)
+        self._preview_overlay = overlay
+        overlay.destroyed.connect(lambda *_: setattr(self, "_preview_overlay", None))
+        overlay.show_preview()
+
+    # ------------------------------------------------------------------
+    # Template capture (called from settings view)
+    # ------------------------------------------------------------------
+
+    def _rebuild_ally_bomb_template_from_enemy(
+        self,
+        enemy_path: Path,
+        ally_path: Path,
+    ) -> bool:
+        """Build the ally bomb template by recolouring the enemy silhouette.
+
+        The ally icon has the same stable shape as the enemy icon but a cyan
+        tint. Capturing the ally icon directly from gameplay proved unreliable
+        because the icon sits over arbitrary backgrounds. Rebuilding it from the
+        known-good enemy asset removes that dependency entirely.
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return False
+
+        enemy_img = cv2.imread(str(enemy_path), cv2.IMREAD_UNCHANGED)
+        if enemy_img is None or enemy_img.ndim != 3 or enemy_img.shape[2] != 4:
+            return False
+
+        ally_img = enemy_img.copy()
+        ally_bgr = ally_img[:, :, :3]
+        alpha = ally_img[:, :, 3] > 0
+
+        # Recolour only the red-tinted pixels. Dark interior details and the
+        # alpha silhouette stay intact, which preserves the icon structure.
+        b_chan = ally_bgr[:, :, 0].astype("int16")
+        g_chan = ally_bgr[:, :, 1].astype("int16")
+        r_chan = ally_bgr[:, :, 2].astype("int16")
+        tint_mask = alpha & (r_chan >= g_chan + 12) & (r_chan >= b_chan + 12) & (r_chan >= 40)
+        if not np.any(tint_mask):
+            tint_mask = alpha
+
+        hsv = cv2.cvtColor(ally_bgr, cv2.COLOR_BGR2HSV)
+        # OpenCV hue 90-95 is bright cyan. Preserve S/V so the original shading
+        # and antialiasing survive the recolour.
+        hsv[:, :, 0][tint_mask] = 92
+        hsv[:, :, 1][tint_mask] = np.maximum(hsv[:, :, 1][tint_mask], 170)
+        hsv[:, :, 2][tint_mask] = np.maximum(hsv[:, :, 2][tint_mask], 150)
+        ally_img[:, :, :3] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+        ally_path.parent.mkdir(parents=True, exist_ok=True)
+        return bool(cv2.imwrite(str(ally_path), ally_img))
+
+    def capture_bomb_template(self, side: str) -> None:
+        """Refresh a bomb-icon template.
+
+        Enemy templates are captured from calibrated regions using HSV
+        segmentation. Ally templates are rebuilt from the enemy silhouette,
+        which is more reliable than trying to isolate a cyan icon over an
+        arbitrary gameplay background.
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            QMessageBox.warning(
+                None, "Missing dependency",
+                "OpenCV (cv2) is required for template capture.",
+            )
             return
 
-        # Logic Check
-        # Show if (match started) OR (recent damage < 60s)
-        # CRITICAL FIX: Even if match is "Active", we rely on log activity to decide if we are actually PLAYING.
-        # But wait, user said "display message when program detects window is game".
-        # This auto-hide request implies: "If I am afk in space (no damage) even in a match, maybe hide?"
-        # The user's request: "auto hide works again, when no important log activity... is detected"
-        # Since 'match_active_signal' stays True for the whole match 20mins+, this forces it ALWAYS on.
-        # We need to qualify 'match_active_signal' with activity or just rely entirely on activity?
-        # A compromise: If match_active_signal is True, we usually WANT it on.
-        # But maybe the user means AFTER the match ends? 
-        # Or maybe they specifically mean "If I haven't taken damage for X time, hide it".
-        
-        # User phrasing: "auto hide works again, when no important log activity ... is detected"
-        # This suggests strictly time-based activity checking.
-        
-        now = time.time()
-        
-        # We treat 'match_active_signal' as a prerequisite, but activity as the trigger?
-        # No, 'Start gameplay' IS a trigger.
-        # Let's combine them: 
-        # Visible IF: (Match Is Active) AND (Recent Activity < 60s)
-        # But sitting in space waiting for bomb is idle. We don't want it to hide then.
-        
-        # Re-reading: "Wait for significant log activity... and check lines in reverse... until Start gameplay found"
-        # The user seems to want the *Initial* appearance to be activity based.
-        # But "auto hide" implies disappearing later.
-        
-        # Let's effectively change logic to:
-        # Show IF: (Recent Damage < 60s)
-        # The 'match_active_signal' is just state tracking.
-        # However, we want it to show up when Bomb timer is running?
-        # Let's stick to the user's specific text: "auto hide works again, when no important log activity"
-        
-        should_show = (now - self.last_damage_time < 60.0)
-        
-        if should_show and not self._is_visible:
-             if self.overlay: self.overlay.show()
-             self._is_visible = True
-        elif not should_show and self._is_visible:
-             if self.overlay: self.overlay.hide()
-             self._is_visible = False
-
-    def _update_overlay_ui(self):
-        if not self.overlay or not self._is_visible:
+        assets_dir = Path(__file__).parent / "assets"
+        if side == "ally":
+            enemy_path = assets_dir / "Enemy bomb logo.png"
+            ally_path = assets_dir / "Allied bomb logo.png"
+            if not self._rebuild_ally_bomb_template_from_enemy(enemy_path, ally_path):
+                QMessageBox.warning(
+                    None, "Template build failed",
+                    "Could not rebuild the allied bomb template from the enemy asset.",
+                )
+                return
+            self._scanner.load_template("bomb_ally", ally_path)
+            QMessageBox.information(
+                None, "Template saved",
+                f"Rebuilt allied bomb template from enemy silhouette.\nSaved to: {ally_path}",
+            )
             return
-        if not self.overlay_editing:
-            self.overlay.ensure_position()
-            
-        now = time.time()
-        
-        # Ensure multi lists exists
-        if not hasattr(self, "agony_multi_labels"):
-            self.agony_multi_labels = []
 
-        # Unpack all to ensure strict order on repack
-        self.agony_label.pack_forget()
-        for l in self.agony_multi_labels:
-            l.pack_forget()
-        
-        self.torp_label.pack_forget()
-        self.bomb_ally_label.pack_forget()
-        self.bomb_enemy_label.pack_forget()
+        # Collect all calibrated regions for this side
+        captures: list[tuple[str, "np.ndarray"]] = []
+        for screen_mode in ("ingame", "respawn"):
+            region_key = _BOMB_REGION_KEYS[side][screen_mode]
+            region_vals = self.settings.regions.get(region_key)
+            if not region_vals or len(region_vals) != 4:
+                continue
+            img = self._scanner.capture_region_image(tuple(region_vals))
+            if img is not None:
+                captures.append((screen_mode, img))
 
-        conquest_visible = False
-        content_visible = False
-        
-        # 1. Agony
-        if self.enable_agony_var.get() and self.match_active_signal:
-            extras = [v.get().strip() for v in self.agony_users_vars if v.get().strip()]
-            multi_mode = bool(extras)
-            
-            if not extras:
-                # Single (Original) Mode
-                self.agony_label.pack(anchor="w")
-                content_visible = True
-                if now < self.agony_active_until:
-                    # Active -> Yellow
-                    self.agony_label.config(text=f"Agony buff: ACTIVE {int(self.agony_active_until - now)}s", fg="#ffff33")
-                elif now < self.agony_cooldown_until:
-                    # CD -> Red
-                    self.agony_label.config(text=f"Agony buff: CD {int(self.agony_cooldown_until - now)}s", fg="#ff3333")
-                else:
-                    # Ready -> Green
-                    self.agony_label.config(text="Agony buff: READY", fg="#33ff33")
-            else:
-                # Multi User Mode
-                self.agony_label.pack(anchor="w")
-                content_visible = True
-                self.agony_label.config(text="Agony buff:", fg="white")
-                
-                # Gather items
-                items = []
-                # Main
-                main_name = self.config.username if self.config.username else "Main"
-                items.append((main_name, self.agony_active_until, self.agony_cooldown_until))
-                
-                # Extras
-                for name in extras:
-                    state = self.agony_states.get(name.lower(), {})
-                    items.append((name, state.get("active_until", 0.0), state.get("cooldown_until", 0.0)))
-                
-                # Ensure labels
-                while len(self.agony_multi_labels) < len(items):
-                    font_px = ("Segoe UI", -16, "bold")
-                    l = tk.Label(self.overlay_left_frame, font=font_px, bg="black", fg="white")
-                    self.agony_multi_labels.append(l)
-                
-                # Update
-                for i, (name, active, cd) in enumerate(items):
-                    lbl = self.agony_multi_labels[i]
-                    lbl.pack(anchor="w", padx=(20, 0))
-                    content_visible = True
-                    
-                    if now < active:
-                        # Active -> Yellow
-                        lbl.config(text=f"{name}: ACTIVE {int(active - now)}s", fg="#ffff33")
-                    elif now < cd:
-                        # CD -> Red
-                        lbl.config(text=f"{name}: CD {int(cd - now)}s", fg="#ff3333")
-                    else:
-                        # Ready -> Green
-                        lbl.config(text=f"{name}: READY", fg="#33ff33")
+        if not captures:
+            QMessageBox.warning(
+                None, "No regions calibrated",
+                f"Calibrate at least one {side} bomb region first.",
+            )
+            return
+
+        # HSV ranges for bomb icon color detection
+        if side == "ally":
+            # Cyan: H≈65-120 (wider range), permissive S/V to capture the
+            # full icon including slightly desaturated shades.
+            hsv_ranges = [((65, 65, 65), (120, 255, 255))]
         else:
-            multi_mode = False
+            # Red wraps around in HSV: H≈0-12 or H≈168-180
+            hsv_ranges = [
+                ((0, 65, 65), (12, 255, 255)),
+                ((168, 65, 65), (180, 255, 255)),
+            ]
 
-        # 2. Torpedoes
-        # Only show if enabled AND in Conquest mode (ClanShip)
-        if self.enable_torp_var.get() and self.match_is_conquest:
-            conquest_visible = True
-            self.torp_label.pack(anchor="w")
-            content_visible = True
-            if now < self.torp_next_wave:
-                rem = int(self.torp_next_wave - now)
-                self.torp_label.config(text=f"Torpedos: {rem}s", fg="#ff8800")
-            else:
-                self.torp_label.config(text="Torpedos: READY", fg="#33ff33")
+        # Bomb icon tile is ~30-45px; score candidates by closeness to ideal.
+        _IDEAL_SIZE = 35  # pixels (approx bomb icon/tile dimension)
+        best_icon = None
+        best_score = float("inf")
+        best_source = ""
+        _ingame_done = False   # track when ingame pass finishes
 
-        # 3. Bombs
-        # Only show if enabled AND in Conquest mode
-        if self.enable_bomb_var.get() and self.match_is_conquest:
-            conquest_visible = True
-            self.bomb_ally_label.pack(anchor="w")
-            self.bomb_enemy_label.pack(anchor="w")
-            content_visible = True
-            
-            # Ally Bomb
-            # Logic:
-            # 1. Timer Active -> Show Timer (Red)
-            # 2. Timer Finished -> Show Ready
-            if now < self.bomb_ally_respawn_time:
-                rem = int(self.bomb_ally_respawn_time - now)
-                self.bomb_ally_label.config(text=f"Allied Bomb: {rem}s", fg="#ff3333")
-            else:
-                self.bomb_ally_label.config(text="Allied Bomb: READY", fg="#33ff33") # Green
+        # Save all captures for debug regardless
+        debug_dir = USER_DATA_DIR / "_template_captures"
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-            # Enemy Bomb
-            # Logic:
-            # 1. Timer Active -> Show Timer (Red)
-            # 2. Timer Finished -> Show Ready
-            if now < self.bomb_respawn_time:
-                rem = int(self.bomb_respawn_time - now)
-                self.bomb_enemy_label.config(text=f"Enemy Bomb: {rem}s", fg="#ff3333")
-            else:
-                self.bomb_enemy_label.config(text="Enemy Bomb: READY", fg="#33ff33")
+        # captures is ordered ingame first (see collection loop above).
+        # If ingame yields a candidate we skip respawn entirely to avoid
+        # false positives from cyan sky backgrounds on the respawn screen.
+        for source, img_bgr in captures:
+            if _ingame_done and best_icon is not None:
+                break  # already found a clean ingame icon — skip respawn
 
-        # If nothing is visible, hide immediately to avoid an empty black box lingering after matches
-        if not content_visible:
-            if self._is_visible and self.overlay:
-                self.overlay.hide()
-                self._is_visible = False
+            cv2.imwrite(str(debug_dir / f"{side}_{source}.png"), img_bgr)
+
+            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            for lo, hi in hsv_ranges:
+                mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+
+            # 5×5 close merges nearby parts of same icon (bomb has internal
+            # gaps that split under a smaller kernel).
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open,  iterations=1)
+
+            cv2.imwrite(str(debug_dir / f"{side}_{source}_mask.png"), mask)
+
+            # For the ally respawn region, the top half is dominated by
+            # a large cyan sky background; restrict search to lower half.
+            search_y_start = 0
+            if source == "respawn" and side == "ally":
+                search_y_start = img_bgr.shape[0] // 2
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cand_idx = 0
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                # Skip blobs in the restricted header zone
+                if (y + h // 2) < search_y_start:
+                    continue
+                # Max 55px per side (icon tile including border frame)
+                if w < 12 or h < 12 or w > 55 or h > 55:
+                    continue
+                # Aspect ratio roughly square-ish (bomb icon is ~1:1)
+                aspect = w / max(h, 1)
+                if aspect < 0.6 or aspect > 1.7:
+                    continue
+                # Fill ratio: bomb icon is fairly dense, not a thin outline
+                fill = cv2.contourArea(cnt) / (w * h)
+                if fill < 0.25:
+                    continue
+                # Save every valid candidate for diagnostics
+                pad_d = 5
+                _dx0 = max(0, x - pad_d); _dy0 = max(0, y - pad_d)
+                _dx1 = min(img_bgr.shape[1], x + w + pad_d)
+                _dy1 = min(img_bgr.shape[0], y + h + pad_d)
+                cv2.imwrite(
+                    str(debug_dir / f"{side}_{source}_cand{cand_idx}_{w}x{h}.png"),
+                    img_bgr[_dy0:_dy1, _dx0:_dx1],
+                )
+                cand_idx += 1
+                # Score: prefer size closest to ideal
+                size_dev = abs((w + h) / 2 - _IDEAL_SIZE)
+                if size_dev < best_score:
+                    best_score = size_dev
+                    # Crop with small padding
+                    pad = 3
+                    x0 = max(0, x - pad)
+                    y0 = max(0, y - pad)
+                    x1 = min(img_bgr.shape[1], x + w + pad)
+                    y1 = min(img_bgr.shape[0], y + h + pad)
+                    icon_bgr = img_bgr[y0:y1, x0:x1]
+                    bgra = cv2.cvtColor(icon_bgr, cv2.COLOR_BGR2BGRA)
+                    # Alpha: filled contour dilated by ~9px so the match
+                    # area includes the dark interior detail pixels of the
+                    # icon, not just the bright cyan outline.  This makes
+                    # template matching compare the full icon structure.
+                    contour_alpha = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+                    cv2.drawContours(contour_alpha, [cnt], -1, 255, cv2.FILLED)
+                    dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+                    contour_alpha = cv2.dilate(contour_alpha, dil_k, iterations=1)
+                    bgra[:, :, 3] = contour_alpha[y0:y1, x0:x1]
+                    best_icon = bgra
+                    best_source = source
+
+            if source == "ingame":
+                _ingame_done = True
+
+        if best_icon is None:
+            QMessageBox.warning(
+                None, "No bomb icon found",
+                f"Could not detect a {side} bomb icon in the captured regions.\n\n"
+                f"Make sure a bomb is being carried (icon visible in the roster), "
+                f"then try again.\n\n"
+                f"Raw captures and masks saved to:\n{debug_dir}",
+            )
             return
 
-        self._layout_overlay_frames(multi_mode, conquest_visible)
+        # Save the new template
+        template_name = "Allied bomb logo.png" if side == "ally" else "Enemy bomb logo.png"
+        template_path = assets_dir / template_name
+        cv2.imwrite(str(template_path), best_icon)
 
-    def _build_overlay_content(self):
-        if not self.overlay: return
-        for w in self.overlay.container.winfo_children(): w.destroy()
-        
-        # Reset multi-label cache since we destroyed the window content
-        self.agony_multi_labels = []
+        # Reload in scanner
+        scanner_key = f"bomb_{side}"
+        self._scanner.load_template(scanner_key, template_path)
 
-        # Two-column capable layout
-        self.overlay.container.grid_columnconfigure(0, weight=1)
-        self.overlay.container.grid_columnconfigure(1, weight=1)
+        h, w = best_icon.shape[:2]
+        QMessageBox.information(
+            None, "Template saved",
+            f"Captured {side} bomb template ({w}×{h}px) from {best_source} region.\n"
+            f"Saved to: {template_path}",
+        )
 
-        self.overlay_left_frame = tk.Frame(self.overlay.container, bg="black")
-        self.overlay_right_frame = tk.Frame(self.overlay.container, bg="black")
+    # ------------------------------------------------------------------
+    # Overlay edit mode (called from tile if wired up later)
+    # ------------------------------------------------------------------
 
-        # Use pixel-sized fonts (negative size) so text doesn't rescale with DPI moves
-        font_px = ("Segoe UI", -16, "bold")
-        self.agony_label = tk.Label(self.overlay_left_frame, text="Agony buff: READY", font=font_px, bg="black", fg="white")
-        self.torp_label = tk.Label(self.overlay_right_frame, text="Torpedos: READY", font=font_px, bg="black", fg="white")
-        self.bomb_ally_label = tk.Label(self.overlay_right_frame, text="Allied Bomb: READY", font=font_px, bg="black", fg="white")
-        self.bomb_enemy_label = tk.Label(self.overlay_right_frame, text="Enemy Bomb: READY", font=font_px, bg="black", fg="white")
+    @property
+    def is_overlay_editing(self) -> bool:
+        return self._overlay_editing
 
-    def _layout_overlay_frames(self, multi_mode: bool, show_conquest: bool):
-        if not self.overlay:
+    def toggle_overlay_edit(self) -> None:
+        if self._overlay is None:
+            self._build_overlay()
+        if self._overlay is None:
             return
 
-        # Reset geometry before re-applying
-        if hasattr(self, "overlay_left_frame"):
-            self.overlay_left_frame.grid_forget()
-        if hasattr(self, "overlay_right_frame"):
-            self.overlay_right_frame.grid_forget()
+        self._overlay_editing = not self._overlay_editing
+        self._sync_overlay_edit_state()
 
-        if not hasattr(self, "overlay_left_frame") or not hasattr(self, "overlay_right_frame"):
+        if self._overlay_editing:
+            self._overlay.set_edit_mode(True)
+            self._overlay.move_to_physical(self.settings.overlay_x, self.settings.overlay_y)
+            self._overlay.show()
+            self._overlay.raise_()
             return
 
-        if multi_mode and show_conquest:
-            self.overlay_left_frame.grid(row=0, column=0, sticky="nw")
-            self.overlay_right_frame.grid(row=0, column=1, sticky="nw", padx=(16, 0))
-        else:
-            self.overlay_left_frame.grid(row=0, column=0, sticky="nw")
-            if show_conquest:
-                self.overlay_right_frame.grid(row=1, column=0, sticky="nw", pady=(8, 0))
-
-    def _toggle_overlay_vis(self):
-        # Just toggle the master switch. Logic handles the rest.
-        new_val = not self.master_overlay_enabled.get()
-        self.master_overlay_enabled.set(new_val)
-        if self.overlay_btn_text:
-             self.overlay_btn_text.set(f"Overlay Master: {'ON' if new_val else 'OFF'}")
-        self._update_visibility_logic() # Apply immediately
-        self._save_settings()
-
-    def _update_overlay_visibility(self):
-        # Deprecated: Logic now inside _update_visibility_logic
-        self._update_visibility_logic()
-
-    def _on_overlay_move(self, x: int, y: int):
-        if not self.overlay_editing:
-            return
-        self.overlay_x = x
-        self.overlay_y = y
-        if self.overlay:
-            self.overlay.set_target_position(x, y)
-        self._save_settings()
-
-    def _toggle_overlay_edit(self):
-        if self.overlay:
-            mode = not getattr(self.overlay, "_is_editing", False)
-            self.overlay.toggle_edit_mode(mode)
-            self.overlay._is_editing = mode
-            self.overlay_editing = mode
-            if not mode:
-                # Persist final position when leaving edit mode
-                pos = self.overlay.get_physical_position()
-                self.overlay_x, self.overlay_y = pos
-                self.overlay.set_target_position(self.overlay_x, self.overlay_y)
-                self._save_settings()
-            if mode: self.overlay.show() 
-
-    # --- Calibration ---
-    def _calibrate_region(self, name: str):
-        def cb(rect):
-            self.regions[name] = rect
-            self._save_settings()
-            self._update_region_labels()
-            messagebox.showinfo("Calibration", f"Region '{name}' set.")
-        
-        CalibrationOverlay(self.app, cb, selection_type="region")
-
-    def _calibrate_point(self, name: str):
-        def cb(rect):
-            self.points[name] = (rect[0], rect[1])
-            self._save_settings()
-            # Refresh debug labels immediately
-            self.app.after(0, self._apply_debug_labels, {})
-            messagebox.showinfo("Calibration", f"Point '{name}' set.")
-        
-        CalibrationOverlay(self.app, cb, selection_type="point")
-
-    def _preview_regions(self):
-        """Show colored boxes for set regions temporarily"""
-        self._show_preview_overlay(regions=self.regions)
-
-    def _preview_points(self):
-        """Show colored dots for set points temporarily"""
-        self._show_preview_overlay(points=self.points)
-
-    def _show_preview_overlay(self, regions=None, points=None):
-        if not regions and not points:
-             return
-             
-        # Create non-interactive transparent overlay
-        win = tk.Toplevel(self.app)
-        win.attributes("-alpha", 0.5)
-        win.attributes("-topmost", True)
-        win.attributes("-fullscreen", True)
-        win.attributes("-transparentcolor", "black") # Windows only
-        win.configure(bg="black")
-        
-        canvas = tk.Canvas(win, bg="black", highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
-
-        if regions:
-            for name, r in regions.items():
-                # r = (x, y, w, h)
-                # Tkinter canvas coords need conversion if stored as physical?
-                # Actually, our CalibrationOverlay returns physical coords.
-                # If we draw on fullscreen window, we need logic coords OR handle DPI.
-                # Since we turned OFF scaling for app probably, or handling it manually.
-                # Let's try drawing text + rect.
-                
-                # We need to map Physical -> Logical if Tkinter is scaled.
-                # But earlier we found Tkinter coordinates in 'self.regions' are from 'GetCursorPos' (Physical).
-                # To draw on Tkinter Canvas which *is* scaled, we might have issues.
-                # BUT, if we create a canvas on a fullscreen window, Tkinter maps it to what it thinks is the screen.
-                # It is safer to use the 'CalibrationOverlay' approach using ctypes logic or valid geometry.
-                
-                # Simplified: Just draw. If inaccurate, user will see offset (which serves as a calibration check too!)
-                
-                # Color code
-                color = "#33ff33" if "ally" in name else "#ff3333"
-                
-                canvas.create_rectangle(r[0], r[1], r[0]+r[2], r[1]+r[3], outline=color, width=3)
-                canvas.create_text(r[0], r[1]-10, text=name, fill=color, anchor="sw", font=("Consolas", 14, "bold"))
-
-        if points:
-            for name, (x, y) in points.items():
-                color = "#3de7ff"
-                r = 5
-                canvas.create_oval(x-r, y-r, x+r, y+r, fill=color, outline=color)
-                canvas.create_text(x+10, y, text=name, fill=color, anchor="w", font=("Consolas", 12, "bold"))
-
-        # Auto-close
-        win.after(10000, win.destroy)
-        
-        # Click to close
-        canvas.bind("<Button-1>", lambda e: win.destroy())
-
-    # --- Settings ---
-    def _load_settings(self):
-        if self.settings_file.exists():
-            try:
-                data = json.loads(self.settings_file.read_text())
-                self.regions = {k: tuple(v) for k,v in data.get("regions", {}).items()}
-                self.points = {k: tuple(v) for k,v in data.get("points", {}).items()}
-                
-                # Agony Users
-                ag_users = data.get("agony_users", [])
-                self.agony_users_vars = [tk.StringVar(value=u) for u in ag_users]
-                
-                self.enable_agony_var.set(data.get("agony", False))
-                self.enable_bomb_var.set(data.get("bomb", False))
-                self.enable_torp_var.set(data.get("torp", False))
-                self.enable_capture_var.set(data.get("capture", False))
-                self.enable_overlay_var.set(data.get("overlay", True))
-                
-                # Load Position
-                pos = data.get("overlay_pos", [100, 100])
-                self.overlay_x, self.overlay_y = pos[0], pos[1]
-            except Exception:
-                pass
-
-    def _save_settings(self):
-        # Update current pos if overlay exists and user is editing
-        if self.overlay and self.overlay_editing:
-            pos_x, pos_y = self.overlay.get_physical_position()
-            self.overlay_x = pos_x
-            self.overlay_y = pos_y
-            self.overlay.set_target_position(self.overlay_x, self.overlay_y)
-            
-        data = {
-            "regions": self.regions,
-            "points": self.points,
-            "agony": self.enable_agony_var.get(),
-            "agony_users": [v.get() for v in self.agony_users_vars],
-            "bomb": self.enable_bomb_var.get(),
-            "torp": self.enable_torp_var.get(),
-            "capture": self.enable_capture_var.get(),
-            "overlay": self.enable_overlay_var.get(),
-            "overlay_pos": [self.overlay_x, self.overlay_y]
-        }
-        self.settings_file.write_text(json.dumps(data, indent=2))
+        self._overlay.set_edit_mode(False)
+        px, py = self._overlay.get_physical_position()
+        self.settings.overlay_x = px
+        self.settings.overlay_y = py
+        self.settings.save()
+        self._update_overlay()

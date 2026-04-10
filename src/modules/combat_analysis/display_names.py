@@ -1,68 +1,102 @@
+"""Legacy-compatible display-name manager.
+
+Supports both the old flat JSON format and the newer wrapped {"mappings": {...}}
+format so existing display_names.json files continue to work.
+"""
+
+from __future__ import annotations
+
 import json
-import os
 from pathlib import Path
-from typing import Dict, Optional
+
+from src.core.config import ROOT_DIR, USER_DATA_DIR
+
 
 class DisplayNameManager:
-    def __init__(self, config_path: Path):
-        self.config_path = config_path / "display_names.json"
-        self.mappings: Dict[str, str] = {}
+    def __init__(self, config_path: Path | None = None) -> None:
+        root = Path(config_path) if config_path is not None else USER_DATA_DIR
+        self.config_path = root / "display_names.json"
+        self.mappings: dict[str, str] = {}
         self.load()
 
-    def load(self):
-        if self.config_path.exists():
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    self.mappings = json.load(f)
-            except Exception as e:
-                print(f"Error loading display names: {e}")
-                self.mappings = {}
-        else:
+    def load(self) -> None:
+        self.mappings = {}
+        try:
+            candidate_paths = [self.config_path, ROOT_DIR / "old" / "user_data" / "display_names.json"]
+            for path in candidate_paths:
+                if not path.exists():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("mappings"), dict):
+                    data = data["mappings"]
+                if not isinstance(data, dict):
+                    continue
+                for log_name, display_name in data.items():
+                    key = str(log_name).strip()
+                    value = str(display_name).strip()
+                    if key:
+                        self.mappings[key] = value
+                if self.mappings:
+                    break
+        except Exception:
             self.mappings = {}
 
-    def save(self):
-        try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.mappings, f, indent=4, sort_keys=True)
-        except Exception as e:
-            print(f"Error saving display names: {e}")
+    def save(self) -> None:
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text(
+            json.dumps(self.mappings, indent=4, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def get(self, log_name: str) -> str:
+        return self.get_display_name(log_name)
 
     def get_display_name(self, log_name: str) -> str:
-        return self.mappings.get(log_name, log_name)
+        mapped = self.mappings.get(log_name)
+        return mapped if mapped else log_name
 
-    def set_display_name(self, log_name: str, display_name: str):
-        if not display_name:
-            if log_name in self.mappings:
-                del self.mappings[log_name]
-        else:
-            self.mappings[log_name] = display_name
+    def set(self, log_name: str, display_name: str) -> None:
+        self._set_mapping(log_name, display_name)
+
+    def set_display_name(self, log_name: str, display_name: str) -> None:
+        self._set_mapping(log_name, display_name)
         self.save()
 
-    def bulk_update(self, entries: Dict[str, str]) -> int:
-        """Apply multiple display-name changes at once. Returns number of updated entries."""
+    def _set_mapping(self, log_name: str, display_name: str) -> None:
+        key = (log_name or "").strip()
+        if not key:
+            return
+        value = (display_name or "").strip()
+        if not value or value == key:
+            self.mappings.pop(key, None)
+        else:
+            self.mappings[key] = value
+
+    def bulk_update(self, entries: dict[str, str]) -> int:
         changed = 0
         for log_name, display_name in entries.items():
             key = (log_name or "").strip()
             if not key:
                 continue
-            value = (display_name or "").strip()
-            if not value:
-                if key in self.mappings:
-                    del self.mappings[key]
-                    changed += 1
-                continue
-            if self.mappings.get(key) != value:
-                self.mappings[key] = value
+            old = self.mappings.get(key)
+            self._set_mapping(key, display_name)
+            new = self.mappings.get(key)
+            if old != new:
                 changed += 1
         if changed:
             self.save()
         return changed
 
-    def export(self, destination: Path):
+    def get_all(self) -> dict[str, str]:
+        return dict(self.mappings)
+
+    def get_all_mappings(self) -> dict[str, str]:
+        return dict(self.mappings)
+
+    def export(self, destination: Path) -> None:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("w", encoding="utf-8") as f:
-            json.dump(self.mappings, f, indent=4, sort_keys=True)
-
-    def get_all_mappings(self) -> Dict[str, str]:
-        return self.mappings.copy()
+        destination.write_text(
+            json.dumps(self.mappings, indent=4, sort_keys=True),
+            encoding="utf-8",
+        )

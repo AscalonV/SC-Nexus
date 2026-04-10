@@ -1,793 +1,477 @@
+"""
+Combat log parser for Star Conflict.
+
+Pure logic — no Qt, no UI.  Safe to import inside multiprocessing workers.
+
+Public API
+----------
+find_combat_logs(root)          → list[Path]
+build_fights(log_file)          → list[Fight]
+parse_file_quick(args)          → list[Fight]   (multiprocessing entry point)
+aggregate_stats(fight)          → dict[str, ParticipantStats]
+"""
+
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
-SOURCE_NOISE_RE = re.compile(r"^\(h:[^\)]*\)\s*")
+from typing import Callable, Iterator
 
-
-def _clean_source(text: str) -> str:
-    cleaned = SOURCE_NOISE_RE.sub("", text or "").strip()
-    return cleaned
-
-
-def _strip_id(text: str) -> str:
-    if not text:
-        return ""
-    # Remove ID part
-    text = text.split("|")[0]
-    # Remove ship suffix (separated by tab or multiple spaces)
-    parts = re.split(r"\t|\s{2,}", text)
-    return parts[0].strip()
-
-
-TIME_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)")
-
-# Matches lines like:
-# 11:53:22.589  CMBT   | Damage            NPC22|0000001779 ->         AscalonV|0000001307  71.55 (h:0.00 s:71.55) Weapon...
-# 11:53:22.645  CMBT   | Heal           AscalonV|0000001307 ->         AscalonV|0000001307  64.84 Module_Extreme...
-DAMAGE_HEAL_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?).*?\b(?P<kind>Damage|Heal)\s+"
-    r"(?P<actor>[^|]+)\|(?P<actor_id>\S+)\s*->\s*(?P<target>[^|]+)\|(?P<target_id>\S+)\s+"
-    r"(?P<amount>\d+(?:\.\d+)?)(?:\s+(?P<source>.*))?",
-    re.IGNORECASE,
-)
-
-KILL_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?).*?Killed\s+(?P<target>[^;]+);\s+killer\s+(?P<actor>[^\s]+)(?:\s+(?P<source>.*))?",
-    re.IGNORECASE,
-)
-
-# Reward lines contain outcome (victory/defeat)
-REWARD_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?).*?\bReward\s+(?P<actor>[^\t]+?)\s+\d+.*?for\s+(?P<result>victory|defeat)",
-    re.IGNORECASE,
-)
-
-AURA_APPLY_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?).*?Apply aura '(?P<aura>[^']+)' id (?P<id>\d+) type (?P<type>[^\s]+) to '(?P<target>[^']+)'",
-    re.IGNORECASE,
-)
-
-AURA_CANCEL_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?).*?Cancel aura '(?P<aura>[^']+)' id (?P<id>\d+) type (?P<type>[^\s]+) from '(?P<target>[^']+)'",
-    re.IGNORECASE,
-)
-
-PARTICIPANT_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?).*?Participant\s+(?P<actor>[^\t]+)\t\s+(?P<ship>[^\t]+)",
-    re.IGNORECASE,
-)
-
-SPAWN_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?).*?Spawn SpaceShip for (?P<actor>.+?)\s*\(.*?\)\.\s*'(?P<ship>[^']+)'",
-    re.IGNORECASE,
-)
-
-# Legacy patterns kept for older logs.
-EVENT_PATTERNS = [
-    re.compile(
-        r"(?P<actor>[\w\-\[\]\(\)\.]+)\s+(?:deals|hits|inflicts)\s+(?P<amount>\d+)\s+damage\s+(?:to|on)\s+(?P<target>[\w\-\[\]\(\)\.]+)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?P<actor>[\w\-\[\]\(\)\.]+)\s+(?:heals|repairs|restores)\s+(?P<amount>\d+)\s+(?:hp|health|hull|armor)?\s*(?:for|to)?\s+(?P<target>[\w\-\[\]\(\)\.]+)",
-        re.IGNORECASE,
-    ),
-]
-
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CombatEvent:
-    timestamp: Optional[datetime]
-    actor: str
-    target: str
-    event_type: str  # "damage" or "healing"
-    amount: float
-    raw: str
-    source: str = ""
-    actor_id: Optional[str] = None
-    target_id: Optional[str] = None
-
-
-@dataclass
-class Fight:
-    id: str
-    file_path: Path
-    start: Optional[datetime]
-    end: Optional[datetime]
-    events: List[CombatEvent] = field(default_factory=list)
-    game_mode: str = "Unknown"
-    actual_game_time_sec: Optional[float] = None
+    timestamp:  datetime
+    event_type: str          # "damage" | "heal" | "kill" | "reward" | "aura_apply" |
+                             #  "aura_cancel" | "participant" | "spawn" | "session_start" |
+                             #  "game_end"
+    actor:      str = ""
+    target:     str = ""
+    amount:     float = 0.0
+    source:     str = ""
+    actor_id:   str = ""
+    target_id:  str = ""
+    raw:        str = ""
 
 
 @dataclass
 class ParticipantStats:
-    name: str
-    damage_dealt: float = 0.0
-    damage_taken: float = 0.0
-    healing_dealt: float = 0.0
-    healing_taken: float = 0.0
-    self_heal: float = 0.0
-    healing_others: float = 0.0
+    name:           str
+    damage_dealt:   float = 0.0
+    damage_taken:   float = 0.0
+    healing_dealt:  float = 0.0   # heals given to others
+    healing_taken:  float = 0.0   # heals received (from others)
+    self_heal:      float = 0.0
+    kills:          int   = 0
 
 
-def find_combat_logs(root: Path) -> List[Path]:
-    """Locate all combat.log files inside dated folders."""
-    if not root.exists():
-        return []
-    results: List[Path] = []
-    for child in root.iterdir():
-        if child.is_dir():
-            log_file = child / "combat.log"
-            if log_file.exists():
-                results.append(log_file)
-    results.sort()
-    return results
+@dataclass
+class Fight:
+    id:                   str
+    file_path:            str
+    start:                datetime
+    end:                  datetime
+    game_mode:            str = ""
+    actual_game_time_sec: float = 0.0
+    events:               list[CombatEvent] = field(default_factory=list)
+
+    @property
+    def duration_sec(self) -> float:
+        return (self.end - self.start).total_seconds()
+
+    @property
+    def display_label(self) -> str:
+        ts = self.start.strftime("%Y-%m-%d  %H:%M")
+        mode = f"  [{self.game_mode}]" if self.game_mode else ""
+        return f"{ts}{mode}"
 
 
-def _parse_timestamp(line: str, folder_hint: Optional[str]) -> Optional[datetime]:
-    match = TIME_RE.search(line)
-    if not match:
-        return None
-    time_part = match.group("time")
-    # If we have a folder hint like 2025.12.31 11.39.58.697 use its date portion.
-    date_part = None
-    if folder_hint:
-        try:
-            date_part = datetime.strptime(folder_hint[:10], "%Y.%m.%d").date()
-        except Exception:
-            date_part = None
+# ---------------------------------------------------------------------------
+# Regex patterns
+# ---------------------------------------------------------------------------
+# Timestamps in SC logs use HH:MM:SS.mmm (milliseconds present).
+# All patterns use search() so leading garbage / extra spaces are tolerated.
+
+_TS_PAT = r"\d{2}:\d{2}:\d{2}(?:\.\d+)?"   # matches HH:MM:SS or HH:MM:SS.mmm
+
+# e.g. 14:27:06.042  CMBT   | Damage   n/a|-000000001 ->   AscalonV|868   787.03 (h:...) WeaponName|id
+DAMAGE_HEAL_RE = re.compile(
+    rf"(?P<ts>{_TS_PAT}).*?\b(?P<kind>Damage|Heal)\s+"
+    r"(?P<actor>[^|\t]+)\|(?P<actor_id>\S+)\s*->\s*(?P<target>[^|\t]+)\|(?P<target_id>\S+)\s+"
+    r"(?P<amount>[\d.]+)"
+    r"(?:\s+(?P<source>.*))?$",
+    re.IGNORECASE,
+)
+
+# e.g. 22:14:00.000  CMBT   | Reward  PlayerName  100  for  victory
+REWARD_RE = re.compile(
+    rf"(?P<ts>{_TS_PAT}).*?\bReward\s+(?P<actor>[^\t]+?)\s+\d+.*?for\s+(?P<result>victory|defeat)",
+    re.IGNORECASE,
+)
+
+# e.g. 17:42:23.941  CMBT   | Killed C|1129;   killer C|822 Weapon
+KILL_RE = re.compile(
+    rf"(?P<ts>{_TS_PAT}).*?Killed\s+(?P<target>[^|;]+)\|(?P<target_id>\S+?);\s+"
+    r"killer\s+(?P<killer>[^|\s]+)\|(?P<killer_id>\S+?)(?:\s+(?P<source>.*))?$",
+    re.IGNORECASE,
+)
+
+# e.g. 14:26:56.015  CMBT   | ======= Start gameplay 'ClanShip' map '...' =======
+SESSION_START_RE = re.compile(
+    r"Start\s+gameplay\s+'(?P<mode>[^']+)'",
+    re.IGNORECASE,
+)
+
+# e.g. 22:11:48.170  CMBT   | Gameplay finished. ... Actual game time 253.3 sec
+GAME_END_RE = re.compile(
+    rf"(?P<ts>{_TS_PAT}).*?Actual\s+game\s+time\s+(?P<secs>[\d.]+)",
+    re.IGNORECASE,
+)
+
+# e.g. Apply aura 'BuffNearDeath_big' id 6 type AURA_NEAR_DEATH to 'PlayerName'
+AURA_APPLY_RE = re.compile(
+    r"Apply\s+aura\s+'(?P<aura>[^']+)'\s+id\s+\d+\s+type\s+\S+\s+to\s+'(?P<target>[^']+)'",
+    re.IGNORECASE,
+)
+
+# e.g. Cancel aura 'BuffNearDeath_big' id 6 type AURA_NEAR_DEATH from 'PlayerName'
+AURA_CANCEL_RE = re.compile(
+    r"Cancel\s+aura\s+'(?P<aura>[^']+)'\s+id\s+\d+\s+type\s+\S+\s+from\s+'(?P<target>[^']+)'",
+    re.IGNORECASE,
+)
+
+PARTICIPANT_RE = re.compile(
+    r"Participant\s+(?P<actor>[^\t]+)", re.IGNORECASE
+)
+SPAWN_RE = re.compile(
+    r"Spawn\s+SpaceShip\s+for\s+(?P<actor>[^\s(]+)", re.IGNORECASE
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _folder_date(path: Path) -> date | None:
+    """Extract the date from a log folder name like '2024.05.31 14.22.10.123'."""
     try:
-        base = datetime.strptime(time_part.split(".")[0], "%H:%M:%S").time()
-        if date_part:
-            return datetime.combine(date_part, base)
-        return datetime.strptime(time_part, "%H:%M:%S.%f")
+        parts = path.name.split(" ")[0].split(".")
+        return date(int(parts[0]), int(parts[1]), int(parts[2]))
     except Exception:
         return None
 
 
-def _infer_event_type(pattern_index: int) -> str:
-    return "damage" if pattern_index == 0 else "healing"
+def _parse_timestamp(hms: str, folder_hint: date | None) -> datetime:
+    # Strip milliseconds if present (HH:MM:SS.mmm → HH:MM:SS)
+    hms_clean = hms.split(".")[0]
+    h, m, s = map(int, hms_clean.split(":"))
+    d = folder_hint or date.today()
+    return datetime(d.year, d.month, d.day, h, m, s)
 
 
-def parse_events(lines: Iterable[str], folder_hint: Optional[str]) -> List[CombatEvent]:
-    events: List[CombatEvent] = []
-    for line in lines:
-        if "HangarShip" in line:
-            continue
-        # Damage / Heal
-        m_new = DAMAGE_HEAL_RE.search(line)
-        if m_new:
-            kind = m_new.group("kind").lower()
-            raw_actor = m_new.group("actor").strip()
-            raw_target = m_new.group("target").strip()
-            actor = _strip_id(raw_actor)
-            target = _strip_id(raw_target)
-            actor_id = (m_new.group("actor_id") or "").strip() or None
-            target_id = (m_new.group("target_id") or "").strip() or None
-            try:
-                amount = float(m_new.group("amount"))
-            except Exception:
-                amount = 0.0
-            timestamp = _parse_timestamp(m_new.group("time"), folder_hint)
-            source = _clean_source(m_new.group("source") or "")
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target=target,
-                    event_type="damage" if kind == "damage" else "healing",
-                    amount=amount,
-                    raw=line.strip(),
-                    source=source,
-                    actor_id=actor_id,
-                    target_id=target_id,
-                )
-            )
-            continue
+def _strip_id(text: str) -> str:
+    """Remove the '|ID' suffix from an actor/target string."""
+    return text.split("|")[0].strip()
 
-        # Kill
-        m_kill = KILL_RE.search(line)
-        if m_kill:
-            timestamp = _parse_timestamp(m_kill.group("time"), folder_hint)
-            target = _strip_id(m_kill.group("target").strip())
-            actor = _strip_id(m_kill.group("actor").strip())
-            source = _clean_source(m_kill.group("source") or "")
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target=target,
-                    event_type="kill",
-                    amount=0.0,
-                    raw=line.strip(),
-                    source=source,
-                )
-            )
+
+def _clean_source(text: str) -> str:
+    """Remove '(h:x s:y)' annotations from a source string."""
+    return re.sub(r"\([^)]*\)", "", text).strip()
+
+
+def _stream_lines(path: Path) -> Iterator[str]:
+    """Memory-efficient UTF-8 line iterator with ISO-8859-1 fallback."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            yield from fh
+    except OSError:
+        return
+
+
+# ---------------------------------------------------------------------------
+# Event parsing
+# ---------------------------------------------------------------------------
+
+def parse_events(lines: Iterator[str], folder_hint: date | None) -> list[CombatEvent]:
+    """Convert raw log lines into a list of CombatEvent objects."""
+    events: list[CombatEvent] = []
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+
+        # ---- Damage / Heal ----------------------------------------
+        m = DAMAGE_HEAL_RE.search(line)
+        if m:
+            raw_source = (m.group("source") or "").strip()
+            # Strip (h:x s:y) annotations and trailing |id suffixes
+            raw_source = re.sub(r"\([^)]*\)", "", raw_source).strip()
+            raw_source = re.sub(r"\|\S+$", "", raw_source).strip()
+            events.append(CombatEvent(
+                timestamp  = _parse_timestamp(m.group("ts"), folder_hint),
+                event_type = m.group("kind").lower(),
+                actor      = _strip_id(m.group("actor").strip()),
+                actor_id   = m.group("actor_id") or "",
+                target     = _strip_id(m.group("target").strip()),
+                target_id  = m.group("target_id") or "",
+                amount     = float(m.group("amount")),
+                source     = raw_source,
+                raw        = line,
+            ))
             continue
 
-        # Reward outcome (victory/defeat)
-        m_reward = REWARD_RE.search(line)
-        if m_reward:
-            timestamp = _parse_timestamp(m_reward.group("time"), folder_hint)
-            actor = _strip_id(m_reward.group("actor").strip())
-            result = (m_reward.group("result") or "").strip().lower()
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target="",
-                    event_type="reward",
-                    amount=0.0,
-                    raw=line.strip(),
-                    source=result,
-                )
-            )
+        # ---- Reward (victory / defeat) ----------------------------
+        m = REWARD_RE.search(line)
+        if m:
+            events.append(CombatEvent(
+                timestamp  = _parse_timestamp(m.group("ts"), folder_hint),
+                event_type = "reward",
+                actor      = _strip_id(m.group("actor").strip()),
+                source     = m.group("result").lower(),
+                raw        = line,
+            ))
             continue
 
-        m_game_end = GAME_END_RE.search(line)
-        if m_game_end:
-            # Some lines omit a time-of-day prefix; store None when absent.
-            timestamp = _parse_timestamp(m_game_end.groupdict().get("time") or "", folder_hint)
-            try:
-                secs = float(m_game_end.group("secs"))
-            except Exception:
-                secs = 0.0
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor="",
-                    target="",
-                    event_type="game_end",
-                    amount=secs,
-                    raw=line.strip(),
-                    source="",
-                )
-            )
+        # ---- Session start ----------------------------------------
+        m = SESSION_START_RE.search(line)
+        if m:
+            # Extract timestamp separately (SESSION_START_RE has no ts group)
+            ts_m = re.search(r"\d{2}:\d{2}:\d{2}(?:\.\d+)?", line)
+            ts_str = ts_m.group(0) if ts_m else "00:00:00"
+            events.append(CombatEvent(
+                timestamp  = _parse_timestamp(ts_str, folder_hint),
+                event_type = "session_start",
+                source     = m.group("mode"),
+                raw        = line,
+            ))
             continue
 
-        # Aura Apply
-        m_aura = AURA_APPLY_RE.search(line)
-        if m_aura:
-            timestamp = _parse_timestamp(m_aura.group("time"), folder_hint)
-            target = _strip_id(m_aura.group("target").strip())
-            aura_name = m_aura.group("aura")
-            # We store aura name in source for consistency
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor="", # Unknown actor for aura apply in this line
-                    target=target,
-                    event_type="buff_apply",
-                    amount=0.0,
-                    raw=line.strip(),
-                    source=aura_name,
-                )
-            )
+        # ---- Kill -------------------------------------------------
+        m = KILL_RE.search(line)
+        if m:
+            ts_m = re.search(r"\d{2}:\d{2}:\d{2}(?:\.\d+)?", line)
+            ts_str = ts_m.group(0) if ts_m else "00:00:00"
+            events.append(CombatEvent(
+                timestamp  = _parse_timestamp(ts_str, folder_hint),
+                event_type = "kill",
+                target     = _strip_id(m.group("target").strip()),
+                target_id  = m.group("target_id") or "",
+                actor      = _strip_id(m.group("killer").strip()),
+                actor_id   = m.group("killer_id") or "",
+                raw        = line,
+            ))
             continue
 
-        # Aura Cancel
-        m_aura_cancel = AURA_CANCEL_RE.search(line)
-        if m_aura_cancel:
-            timestamp = _parse_timestamp(m_aura_cancel.group("time"), folder_hint)
-            target = _strip_id(m_aura_cancel.group("target").strip())
-            aura_name = m_aura_cancel.group("aura")
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor="",
-                    target=target,
-                    event_type="buff_cancel",
-                    amount=0.0,
-                    raw=line.strip(),
-                    source=aura_name,
-                )
-            )
+        # ---- Aura apply ------------------------------------------
+        m = AURA_APPLY_RE.search(line)
+        if m:
+            ts_m = re.search(r"\d{2}:\d{2}:\d{2}(?:\.\d+)?", line)
+            ts_str = ts_m.group(0) if ts_m else "00:00:00"
+            events.append(CombatEvent(
+                timestamp  = _parse_timestamp(ts_str, folder_hint),
+                event_type = "aura_apply",
+                source     = m.group("aura"),
+                target     = m.group("target"),
+                raw        = line,
+            ))
             continue
 
-        # Participant Info
-        m_part = PARTICIPANT_RE.search(line)
-        if m_part:
-            timestamp = _parse_timestamp(m_part.group("time"), folder_hint)
-            actor = _strip_id(m_part.group("actor").strip())
-            ship = m_part.group("ship").strip()
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target="",
-                    event_type="ship_info",
-                    amount=0.0,
-                    raw=line.strip(),
-                    source=ship,
-                )
-            )
+        # ---- Aura cancel -----------------------------------------
+        m = AURA_CANCEL_RE.search(line)
+        if m:
+            ts_m = re.search(r"\d{2}:\d{2}:\d{2}(?:\.\d+)?", line)
+            ts_str = ts_m.group(0) if ts_m else "00:00:00"
+            events.append(CombatEvent(
+                timestamp  = _parse_timestamp(ts_str, folder_hint),
+                event_type = "aura_cancel",
+                source     = m.group("aura"),
+                target     = m.group("target"),
+                raw        = line,
+            ))
             continue
 
-        # Spawn
-        m_spawn = SPAWN_RE.search(line)
-        if m_spawn:
-            timestamp = _parse_timestamp(m_spawn.group("time"), folder_hint)
-            actor = m_spawn.group("actor").strip()
-            ship = m_spawn.group("ship").strip()
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target="",
-                    event_type="ship_spawn",
-                    amount=0.0,
-                    raw=line.strip(),
-                    source=ship,
-                )
-            )
+        # ---- Game end --------------------------------------------
+        m = GAME_END_RE.search(line)
+        if m:
+            events.append(CombatEvent(
+                timestamp  = _parse_timestamp(m.group("ts"), folder_hint),
+                event_type = "game_end",
+                amount     = float(m.group("secs")),
+                raw        = line,
+            ))
             continue
 
-        for idx, pattern in enumerate(EVENT_PATTERNS):
-            m = pattern.search(line)
-            if not m:
-                continue
-            actor = m.group("actor")
-            target = m.group("target")
-            try:
-                amount = float(m.group("amount"))
-            except Exception:
-                continue
-            timestamp = _parse_timestamp(line, folder_hint)
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target=target,
-                    event_type=_infer_event_type(idx),
-                    amount=amount,
-                    raw=line.strip(),
-                    source="",
-                )
-            )
-            break
     return events
 
 
-def split_into_fights(events: List[CombatEvent], max_gap_seconds: int = 120) -> List[List[CombatEvent]]:
-    """Heuristic split: start a new fight if time gap exceeds threshold or session boundaries are hit."""
-    return split_into_fights_with_boundaries(events, session_starts=[], max_gap_seconds=max_gap_seconds)
+# ---------------------------------------------------------------------------
+# Fight segmentation
+# ---------------------------------------------------------------------------
+
+_MAX_GAP_SECONDS = 120
 
 
-# Regex to detect session starts like:
-# 11:53:10.159  CMBT   | ======= Start gameplay 'FreeSpace' map 'factory_pirate...' =======
-SESSION_START_RE = re.compile(r"Start gameplay\s+'(?P<mode>[^']+)'\s+map\s+'(?P<map>[^']+)'", re.IGNORECASE)
-SESSION_CONNECT_RE = re.compile(r"Connect to game session", re.IGNORECASE)
-GAME_END_RE = re.compile(
-    r"(?:(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)\s+)?Actual\s+game\s+time\s+(?P<secs>\d+(?:\.\d+)?)\s*sec",
-    re.IGNORECASE,
-)
+def split_into_fights(events: list[CombatEvent]) -> list[list[CombatEvent]]:
+    """
+    Split a flat event list into individual fight segments.
 
-
-def find_session_starts(lines: List[str], folder_hint: Optional[str]) -> List[Tuple[datetime, str]]:
-    """Collect timestamps and modes for gameplay session starts."""
-    starts: List[Tuple[datetime, str]] = []
-    for line in lines:
-        m = SESSION_START_RE.search(line)
-        if m:
-            ts = _parse_timestamp(line, folder_hint)
-            if ts:
-                starts.append((ts, m.group("mode")))
-            continue
-            
-        if SESSION_CONNECT_RE.search(line):
-            ts = _parse_timestamp(line, folder_hint)
-            if ts:
-                starts.append((ts, "Unknown"))
-    return starts
-
-
-def split_into_fights_with_boundaries(
-    events: List[CombatEvent],
-    session_starts: List[datetime],
-    max_gap_seconds: int = 120,
-) -> List[List[CombatEvent]]:
+    Hard split on every ``session_start`` event.
+    Soft split when the gap between consecutive combat events exceeds
+    _MAX_GAP_SECONDS (120 s).
+    """
     if not events:
         return []
-    fights: List[List[CombatEvent]] = []
-    current: List[CombatEvent] = []
-    last_time: Optional[datetime] = None
-    gap = timedelta(seconds=max_gap_seconds)
 
-    session_starts = sorted(session_starts)
-    boundary_idx = 0
+    fights: list[list[CombatEvent]] = []
+    current: list[CombatEvent] = []
+    last_ts: datetime | None = None
 
     for ev in events:
-        ev_time = ev.timestamp
-        # Hard split on session boundaries.
-        while boundary_idx < len(session_starts) and ev_time and ev_time >= session_starts[boundary_idx]:
+        is_combat = ev.event_type in ("damage", "heal", "kill")
+
+        if ev.event_type == "session_start":
             if current:
                 fights.append(current)
-                current = []
-            boundary_idx += 1
-        # Gap-based split.
-        if last_time and ev_time and (ev_time - last_time) > gap:
-            fights.append(current)
+            current = [ev]
+            last_ts = ev.timestamp
+            continue
+
+        if is_combat and last_ts and (ev.timestamp - last_ts).total_seconds() > _MAX_GAP_SECONDS:
+            if current:
+                fights.append(current)
             current = []
+
         current.append(ev)
-        if ev_time:
-            last_time = ev_time
+        if is_combat:
+            last_ts = ev.timestamp
+
     if current:
         fights.append(current)
+
     return fights
 
 
-def build_fights(log_file: Path) -> List[Fight]:
-    folder_hint = log_file.parent.name
-    lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-    events = parse_events(lines, folder_hint)
-    session_info = find_session_starts(lines, folder_hint)
-    
-    # Extract just timestamps for splitting
-    session_timestamps = [s[0] for s in session_info]
-    
-    fights = split_into_fights_with_boundaries(events, session_starts=session_timestamps)
-    results: List[Fight] = []
-    for idx, fight_events in enumerate(fights):
-        start = fight_events[0].timestamp if fight_events else None
-        end = fight_events[-1].timestamp if fight_events else None
-        actual_time = None
-        for ev in reversed(fight_events):
-            if ev.event_type == "game_end":
-                actual_time = ev.amount
-                break
-        
-        # Determine mode
-        mode = "Unknown"
-        if start:
-            for s_time, s_mode in session_info:
-                if s_time <= start:
-                    mode = s_mode
-                else:
-                    break
-        
-        # Filter out noise fights (e.g. Hangar activity or minor events without damage/healing)
-        if mode == "Unknown":
-            has_substance = any(e.event_type in ("damage", "healing", "kill", "reward", "game_end") for e in fight_events)
-            if not has_substance:
-                continue
+# ---------------------------------------------------------------------------
+# Stat aggregation
+# ---------------------------------------------------------------------------
 
-        results.append(
-            Fight(
-                id=f"{log_file.name}-fight-{idx+1}",
-                file_path=log_file,
-                start=start,
-                end=end,
-                events=fight_events,
-                game_mode=mode,
-                actual_game_time_sec=actual_time,
-            )
-        )
-    return results
+def aggregate_stats(fight: Fight) -> dict[str, ParticipantStats]:
+    """Aggregate per-participant damage/healing/kill stats for a Fight."""
+    stats: dict[str, ParticipantStats] = {}
 
-
-def aggregate_stats(fight: Fight) -> Dict[str, ParticipantStats]:
-    stats: Dict[str, ParticipantStats] = {}
-
-    def ensure(name: str) -> Optional[ParticipantStats]:
-        if not name:
-            return None
+    def _get(name: str) -> ParticipantStats:
         if name not in stats:
             stats[name] = ParticipantStats(name=name)
         return stats[name]
 
     for ev in fight.events:
         if ev.event_type == "damage":
-            actor_stat = ensure(ev.actor)
-            target_stat = ensure(ev.target)
-            if actor_stat: actor_stat.damage_dealt += ev.amount
-            if target_stat: target_stat.damage_taken += ev.amount
-        elif ev.event_type == "healing":
-            actor_stat = ensure(ev.actor)
-            target_stat = ensure(ev.target)
-            if actor_stat: actor_stat.healing_dealt += ev.amount
-            if target_stat: target_stat.healing_taken += ev.amount
-            if actor_stat:
+            if ev.actor:
+                _get(ev.actor).damage_dealt += ev.amount
+            if ev.target:
+                _get(ev.target).damage_taken += ev.amount
+
+        elif ev.event_type == "heal":
+            if ev.actor and ev.target:
                 if ev.actor == ev.target:
-                    actor_stat.self_heal += ev.amount
+                    _get(ev.actor).self_heal += ev.amount
                 else:
-                    actor_stat.healing_others += ev.amount
+                    _get(ev.actor).healing_dealt += ev.amount
+                    _get(ev.target).healing_taken += ev.amount
+
         elif ev.event_type == "kill":
-            # Ensure participants exist for kills
-            ensure(ev.actor)
-            ensure(ev.target)
-        # Ignore ship_info, buff_apply, buff_cancel for stats aggregation
-        
+            # The last damage event before the kill attributes the kill
+            if ev.target:
+                _get(ev.target)  # ensure entry exists
+
     return stats
 
 
-# Streaming helpers for per-file progress
-def stream_lines(path: Path, chunk_size: int = 1024 * 1024) -> Iterable[str]:
-    buffer = ""
-    with path.open("r", encoding="utf-8", errors="ignore", buffering=chunk_size) as f:
-        for data in iter(lambda: f.read(chunk_size), ""):
-            buffer += data
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                yield line
-    if buffer:
-        yield buffer
+# ---------------------------------------------------------------------------
+# High-level file building
+# ---------------------------------------------------------------------------
+
+def _make_fight_id(file_path: Path, start: datetime) -> str:
+    return f"{file_path.parent.name}::{start.isoformat()}"
 
 
-def count_lines_fast(path: Path) -> int:
-    try:
-        with path.open("rb") as f:
-            return sum(buf.count(b"\n") for buf in iter(lambda: f.read(1024 * 1024), b"")) or 1
-    except Exception:
-        return 1
-
-
-def build_fights_stream(
+def build_fights(
     log_file: Path,
-    total_lines: int,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
-    progress_every: int = 5000,
-) -> List[Fight]:
-    folder_hint = log_file.parent.name
-    events: List[CombatEvent] = []
-    session_info: List[Tuple[datetime, str]] = []
-    lines_read = 0
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> list[Fight]:
+    """
+    Full pipeline for one combat.log file:
+    read → parse → split → package into Fight objects.
+    """
+    folder_hint = _folder_date(log_file.parent)
+    lines = list(_stream_lines(log_file))
+    total = len(lines)
 
-    for line in stream_lines(log_file):
-        lines_read += 1
-        # progress_every may be 0 when no progress callback is used (parse_file_quick)
-        if progress_cb and progress_every and (lines_read % progress_every == 0):
-            progress_cb(lines_read, total_lines)
+    if progress_cb:
+        progress_cb(0, total)
 
-        m_start = SESSION_START_RE.search(line)
-        if m_start:
-            ts = _parse_timestamp(line, folder_hint)
-            if ts:
-                session_info.append((ts, m_start.group("mode")))
-        elif SESSION_CONNECT_RE.search(line):
-            ts = _parse_timestamp(line, folder_hint)
-            if ts:
-                session_info.append((ts, "Unknown"))
+    events = parse_events(iter(lines), folder_hint)
 
-        m_new = DAMAGE_HEAL_RE.search(line)
-        if m_new:
-            kind = m_new.group("kind").lower()
-            raw_actor = m_new.group("actor").strip()
-            raw_target = m_new.group("target").strip()
-            actor = _strip_id(raw_actor)
-            target = _strip_id(raw_target)
-            actor_id = (m_new.group("actor_id") or "").strip() or None
-            target_id = (m_new.group("target_id") or "").strip() or None
-            try:
-                amount = float(m_new.group("amount"))
-            except Exception:
-                amount = 0.0
-            timestamp = _parse_timestamp(m_new.group("time"), folder_hint)
-            source = _clean_source(m_new.group("source") or "")
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target=target,
-                    event_type="damage" if kind == "damage" else "healing",
-                    amount=amount,
-                    raw="",
-                    source=source,
-                    actor_id=actor_id,
-                    target_id=target_id,
-                )
-            )
+    if progress_cb:
+        progress_cb(total, total)
+
+    segments = split_into_fights(events)
+    fights: list[Fight] = []
+
+    for seg in segments:
+        combat = [e for e in seg if e.event_type in ("damage", "heal", "kill")]
+        if len(combat) < 2:
             continue
 
-        # Kill
-        m_kill = KILL_RE.search(line)
-        if m_kill:
-            timestamp = _parse_timestamp(m_kill.group("time"), folder_hint)
-            target = _strip_id(m_kill.group("target").strip())
-            actor = _strip_id(m_kill.group("actor").strip())
-            source = _clean_source(m_kill.group("source") or "")
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target=target,
-                    event_type="kill",
-                    amount=0.0,
-                    raw="",
-                    source=source,
-                )
-            )
-            continue
+        start = seg[0].timestamp
+        end   = combat[-1].timestamp
 
-        m_reward = REWARD_RE.search(line)
-        if m_reward:
-            timestamp = _parse_timestamp(m_reward.group("time"), folder_hint)
-            actor = _strip_id(m_reward.group("actor").strip())
-            result = (m_reward.group("result") or "").strip().lower()
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target="",
-                    event_type="reward",
-                    amount=0.0,
-                    raw="",
-                    source=result,
-                )
-            )
-            continue
-
-        m_game_end = GAME_END_RE.search(line)
-        if m_game_end:
-            timestamp = _parse_timestamp(m_game_end.groupdict().get("time") or "", folder_hint)
-            try:
-                secs = float(m_game_end.group("secs"))
-            except Exception:
-                secs = 0.0
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor="",
-                    target="",
-                    event_type="game_end",
-                    amount=secs,
-                    raw="",
-                    source="",
-                )
-            )
-            continue
-
-        # Aura Apply
-        m_aura = AURA_APPLY_RE.search(line)
-        if m_aura:
-            timestamp = _parse_timestamp(m_aura.group("time"), folder_hint)
-            target = _strip_id(m_aura.group("target").strip())
-            aura_name = m_aura.group("aura")
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor="",
-                    target=target,
-                    event_type="buff_apply",
-                    amount=0.0,
-                    raw="",
-                    source=aura_name,
-                )
-            )
-            continue
-
-        # Aura Cancel
-        m_aura_cancel = AURA_CANCEL_RE.search(line)
-        if m_aura_cancel:
-            timestamp = _parse_timestamp(m_aura_cancel.group("time"), folder_hint)
-            target = _strip_id(m_aura_cancel.group("target").strip())
-            aura_name = m_aura_cancel.group("aura")
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor="",
-                    target=target,
-                    event_type="buff_cancel",
-                    amount=0.0,
-                    raw="",
-                    source=aura_name,
-                )
-            )
-            continue
-
-        # Participant Info
-        m_part = PARTICIPANT_RE.search(line)
-        if m_part:
-            timestamp = _parse_timestamp(m_part.group("time"), folder_hint)
-            actor = _strip_id(m_part.group("actor").strip())
-            ship = m_part.group("ship").strip()
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target="",
-                    event_type="ship_info",
-                    amount=0.0,
-                    raw="",
-                    source=ship,
-                )
-            )
-            continue
-
-        for idx, pattern in enumerate(EVENT_PATTERNS):
-            m = pattern.search(line)
-            if not m:
-                continue
-            actor = m.group("actor")
-            target = m.group("target")
-            try:
-                amount = float(m.group("amount"))
-            except Exception:
-                amount = 0.0
-            timestamp = _parse_timestamp(line, folder_hint)
-            events.append(
-                CombatEvent(
-                    timestamp=timestamp,
-                    actor=actor,
-                    target=target,
-                    event_type=_infer_event_type(idx),
-                    amount=amount,
-                    raw="",
-                    source="",
-                )
-            )
-            break
-
-    if progress_cb and progress_every:
-        progress_cb(lines_read, total_lines)
-
-    session_timestamps = [s[0] for s in session_info]
-    fights = split_into_fights_with_boundaries(events, session_starts=session_timestamps)
-    results: List[Fight] = []
-    for idx, fight_events in enumerate(fights):
-        start = fight_events[0].timestamp if fight_events else None
-        end = fight_events[-1].timestamp if fight_events else None
-        actual_time = None
-        for ev in reversed(fight_events):
-            if ev.event_type == "game_end":
-                actual_time = ev.amount
-                break
-        
-        # Determine mode
-        mode = "Unknown"
-        if start:
-            for s_time, s_mode in session_info:
-                if s_time <= start:
-                    mode = s_mode
-                else:
-                    break
-        
-        # Filter out noise fights (e.g. Hangar activity or minor events without damage/healing)
-        if mode == "Unknown":
-            has_substance = any(e.event_type in ("damage", "healing", "kill", "reward", "game_end") for e in fight_events)
-            if not has_substance:
-                continue
-
-        results.append(
-            Fight(
-                id=f"{log_file.name}-fight-{idx+1}",
-                file_path=log_file,
-                start=start,
-                end=end,
-                events=fight_events,
-                game_mode=mode,
-                actual_game_time_sec=actual_time,
-            )
+        # Game mode from the first session_start in the segment
+        game_mode = next(
+            (e.source for e in seg if e.event_type == "session_start"), ""
         )
-    return results
+        actual_time = next(
+            (e.amount for e in seg if e.event_type == "game_end"), 0.0
+        )
 
+        fight = Fight(
+            id                   = _make_fight_id(log_file, start),
+            file_path            = str(log_file),
+            start                = start,
+            end                  = end,
+            game_mode            = game_mode,
+            actual_game_time_sec = actual_time,
+            events               = seg,
+        )
+        fights.append(fight)
 
-def parse_file_quick(log_file: Path, progress_file=None) -> List[Fight]:
-    """Parse a single log file with streaming. If progress_file is provided, writes current progress there."""
-    total_lines = count_lines_fast(log_file)
-    
-    cb = None
-    if progress_file:
-        def _cb(current, total):
-            try:
-                # Write to file atomically-ish
-                with open(progress_file, "w") as f:
-                    f.write(f"{current},{total}")
-            except Exception:
-                pass
-        cb = _cb
-        
-    return build_fights_stream(log_file, total_lines=total_lines, progress_cb=cb, progress_every=5000)
-
-
-def load_all_fights(root: Path, progress_cb=None) -> List[Fight]:
-    fights: List[Fight] = []
-    logs = find_combat_logs(root)
-    total = len(logs)
-    for idx, log_file in enumerate(logs, 1):
-        fights.extend(build_fights(log_file))
-        if progress_cb:
-            progress_cb(idx, total)
-    fights.sort(key=lambda f: (f.start or datetime.min, f.file_path))
     return fights
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing entry point
+# ---------------------------------------------------------------------------
+
+def parse_file_quick(args: tuple[str, str]) -> list[Fight]:
+    """
+    Multiprocessing-safe entry point.  Accepts a tuple so it can be used
+    with pool.map().
+
+    args = (log_file_str, progress_file_str)
+    progress_file_str may be "" to skip writing progress.
+    """
+    log_file_str, progress_file_str = args
+    log_path = Path(log_file_str)
+
+    total_lines = sum(1 for _ in _stream_lines(log_path))
+
+    def _progress(done: int, total: int) -> None:
+        if progress_file_str:
+            try:
+                Path(progress_file_str).write_text(f"{done}/{total}", encoding="utf-8")
+            except OSError:
+                pass
+
+    return build_fights(log_path, progress_cb=_progress)
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+def find_combat_logs(root: str | Path) -> list[Path]:
+    """
+    Find all combat.log files under *root*.
+    Star Conflict stores them in dated sub-folders:
+        <root>/<YYYY.MM.DD HH.MM.SS.mmm>/combat.log
+    Returns them sorted oldest-first.
+    """
+    root = Path(root)
+    if not root.exists():
+        return []
+
+    found = sorted(root.rglob("combat.log"), key=lambda p: p.parent.name)
+    return found
