@@ -12,19 +12,28 @@ Features
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from html import escape
 import json
 import os
-import queue
 import re
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+import numpy as np
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+
+try:
+    from PySide6.QtMultimedia import QAudioDecoder, QAudioOutput, QMediaPlayer
+except Exception:  # pragma: no cover - environment/package dependent
+    QAudioDecoder = None
+    QAudioOutput = None
+    QMediaPlayer = None
 
 from src.core.config import AppConfig
 from src.core.module_base import ModuleBase, ModuleType
@@ -95,12 +104,15 @@ def _strip_id(name: str) -> str:
 
 
 # ---- sound files -------------------------------------------------------
-_SOUNDS_DIR = Path(__file__).parent / "sounds"
+_MODULE_DIR = Path(__file__).parent
+_SOUNDS_DIR = _MODULE_DIR / "sounds"
+_ASSETS_DIR = _MODULE_DIR / "assets"
 SND_BOMB      = _SOUNDS_DIR / "BombPickupF.wav"
 SND_TORP      = _SOUNDS_DIR / "TorpedosF.wav"
 SND_CAPT_CMD   = _SOUNDS_DIR / "EnemyAtCommandTowerF.wav"
 SND_CAPT_SHLD  = _SOUNDS_DIR / "EnemyAtShieldEmitterF.wav"
 SND_CAPT_WPNC  = _SOUNDS_DIR / "EnemyAtWeaponCoolerF.wav"
+SND_START     = _SOUNDS_DIR / "Start.ogg"
 
 _CAPTURE_SOUNDS: dict[str, Path] = {
     "cmd":    SND_CAPT_CMD,
@@ -123,6 +135,8 @@ class CombatAssistantSettings(BaseModel):
     overlay_y:         int         = 100
     agony_enabled:     bool        = False
     agony_extra_users: list[str]   = Field(default_factory=list)
+    game_start_enabled: bool       = False
+    game_start_volume: int         = Field(default=20, ge=0, le=100)
     torp_enabled:      bool        = False
     bomb_enabled:      bool        = False
     capture_enabled:   bool        = False
@@ -169,6 +183,13 @@ class _BombSide:
     last_scan_time: float = 0.0    # timestamp of last successful scan
 
 
+@dataclass
+class _QueuedSound:
+    path: Path
+    volume: float = 1.0
+    require_foreground: bool = True
+
+
 # ---------------------------------------------------------------------------
 # CombatAssistantModule
 # ---------------------------------------------------------------------------
@@ -177,6 +198,7 @@ class CombatAssistantModule(ModuleBase):
     """TOGGLEABLE — runs silently in the background when enabled."""
 
     overlay_refresh_requested: Signal = Signal()
+    _CENTERED_START_CACHE = USER_DATA_DIR / "combat_assistant_start_centered.wav"
 
     # ModuleBase
     module_id    = "combat_assistant"
@@ -237,12 +259,12 @@ class CombatAssistantModule(ModuleBase):
         self._scan_lock = threading.Lock()
         self._scan_running = False
 
-        # --- Sound queue (daemon thread; plays sequentially) ---
-        self._snd_queue: queue.Queue[Path] = queue.Queue()
-        self._snd_thread = threading.Thread(
-            target=self._sound_worker, daemon=True, name="snd-worker"
-        )
-        self._snd_thread.start()
+        # --- Audio queue (QtMultimedia when available; falls back to WAV-only winsound) ---
+        self._audio_queue: deque[_QueuedSound] = deque()
+        self._audio_output: QAudioOutput | None = None
+        self._audio_player: QMediaPlayer | None = None
+        self._start_sound_path: Path = SND_START
+        self._init_audio_player()
 
         # --- QTimer for periodic scan (1 s) ---
         self._scan_timer = QTimer(self)
@@ -301,6 +323,8 @@ class CombatAssistantModule(ModuleBase):
         if config is None:
             return
 
+        self._start_sound_path = self._prepare_centered_start_sound(SND_START)
+
         # Log tailer
         if self._tailer is None:
             self._tailer = LogTailer(config.logs_path)
@@ -338,6 +362,9 @@ class CombatAssistantModule(ModuleBase):
         if self._tailer:
             self._tailer.stop()
             self._tailer = None
+        self._audio_queue.clear()
+        if self._audio_player is not None:
+            self._audio_player.stop()
         if self._overlay:
             self._overlay_editing = False
             self._overlay.set_edit_mode(False)
@@ -760,6 +787,12 @@ class CombatAssistantModule(ModuleBase):
                 self._match_conquest  = (
                     "'ClanShip'" in line or (m and m.group("mode") == "ClanShip")
                 )
+                if self.settings.game_start_enabled:
+                    self._play_sound(
+                        self._start_sound_path,
+                        volume=self.settings.game_start_volume / 100.0,
+                        require_foreground=False,
+                    )
                 self._bomb_debug("ally", f"match start detected conquest={self._match_conquest}")
                 self._bomb_debug("enemy", f"match start detected conquest={self._match_conquest}")
                 # Torpedo — first wave shortened by 7 s
@@ -1103,23 +1136,180 @@ class CombatAssistantModule(ModuleBase):
     # Sound
     # ------------------------------------------------------------------
 
-    def _play_sound(self, path: Path) -> None:
-        if path.exists():
-            self._snd_queue.put(path)
+    def _prepare_centered_start_sound(self, source: Path) -> Path:
+        if not source.exists() or QAudioDecoder is None:
+            return source
 
-    def _sound_worker(self) -> None:
-        import ctypes
-        while True:
-            path = self._snd_queue.get()
+        cache_path = self._CENTERED_START_CACHE
+        try:
+            if cache_path.exists() and cache_path.stat().st_mtime >= source.stat().st_mtime:
+                return cache_path
+        except OSError:
+            return source
+
+        if self._build_centered_start_sound(source, cache_path):
+            return cache_path
+        return source
+
+    def _build_centered_start_sound(self, source: Path, destination: Path) -> bool:
+        if QAudioDecoder is None:
+            return False
+
+        decoder = QAudioDecoder(self)
+        decoded_chunks: list[np.ndarray] = []
+        sample_rate = 0
+        failed = False
+
+        def _on_buffer_ready() -> None:
+            nonlocal sample_rate, failed
+            buffer = decoder.read()
+            if not buffer.isValid():
+                return
+            mono, rate = self._decode_audio_buffer_to_mono(buffer)
+            if mono is None or rate <= 0:
+                failed = True
+                return
+            if sample_rate == 0:
+                sample_rate = rate
+            elif sample_rate != rate:
+                failed = True
+                return
+            decoded_chunks.append(mono)
+
+        decoder.bufferReady.connect(_on_buffer_ready)
+        decoder.setSource(QUrl.fromLocalFile(str(source.resolve())))
+        decoder.start()
+
+        while decoder.isDecoding():
+            QApplication.processEvents()
+
+        if failed or not decoded_chunks or sample_rate <= 0:
+            return False
+
+        mono = np.concatenate(decoded_chunks)
+        mono = np.clip(mono, -1.0, 1.0)
+        pcm16 = (mono * 32767.0).astype(np.int16)
+
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(destination), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(sample_rate)
+                handle.writeframes(pcm16.tobytes())
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _decode_audio_buffer_to_mono(buffer) -> tuple[np.ndarray | None, int]:
+        fmt = buffer.format()
+        channels = fmt.channelCount()
+        if channels <= 0:
+            return (None, 0)
+
+        raw = bytes(buffer.constData())
+        sample_format = fmt.sampleFormat()
+
+        if sample_format == fmt.SampleFormat.Float:
+            samples = np.frombuffer(raw, dtype=np.float32)
+        elif sample_format == fmt.SampleFormat.Int16:
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sample_format == fmt.SampleFormat.Int32:
+            samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        elif sample_format == fmt.SampleFormat.UInt8:
+            samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        else:
+            return (None, 0)
+
+        frame_samples = (samples.size // channels) * channels
+        if frame_samples <= 0:
+            return (None, 0)
+
+        samples = samples[:frame_samples].reshape(-1, channels)
+        mono = samples.mean(axis=1, dtype=np.float32)
+        return (mono.astype(np.float32, copy=False), fmt.sampleRate())
+
+    def _init_audio_player(self) -> None:
+        if QMediaPlayer is None or QAudioOutput is None:
+            return
+        try:
+            self._audio_output = QAudioOutput(self)
+            self._audio_output.setVolume(1.0)
+            self._audio_player = QMediaPlayer(self)
+            self._audio_player.setAudioOutput(self._audio_output)
+            self._audio_player.mediaStatusChanged.connect(self._on_audio_status_changed)
+            self._audio_player.errorOccurred.connect(self._on_audio_error)
+        except Exception:
+            self._audio_output = None
+            self._audio_player = None
+
+    def _play_sound(
+        self,
+        path: Path,
+        *,
+        volume: float = 1.0,
+        require_foreground: bool = True,
+    ) -> None:
+        if not path.exists():
+            return
+        if require_foreground and not self._is_game_foreground():
+            return
+        self._audio_queue.append(
+            _QueuedSound(
+                path=path,
+                volume=max(0.0, min(1.0, volume)),
+                require_foreground=require_foreground,
+            )
+        )
+        self._start_next_sound()
+
+    def _start_next_sound(self) -> None:
+        if not self._audio_queue:
+            return
+        if self._audio_player is not None:
+            if self._audio_player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+                return
+            next_sound = self._audio_queue.popleft()
             try:
-                # Only play when Star Conflict is in the foreground
-                if self._is_game_foreground():
-                    import winsound
-                    winsound.PlaySound(str(path), winsound.SND_SYNC | winsound.SND_FILENAME)
+                if self._audio_output is not None:
+                    self._audio_output.setVolume(next_sound.volume)
+                self._audio_player.setSource(
+                    QUrl.fromLocalFile(str(next_sound.path.resolve()))
+                )
+                self._audio_player.play()
+                return
             except Exception:
                 pass
-            finally:
-                self._snd_queue.task_done()
+
+        next_sound = self._audio_queue.popleft()
+        self._play_sound_fallback(next_sound.path)
+        if self._audio_queue:
+            QTimer.singleShot(0, self._start_next_sound)
+
+    def _play_sound_fallback(self, path: Path) -> None:
+        if path.suffix.lower() != ".wav":
+            return
+        try:
+            import winsound
+            winsound.PlaySound(str(path), winsound.SND_SYNC | winsound.SND_FILENAME)
+        except Exception:
+            pass
+
+    @Slot(object)
+    def _on_audio_status_changed(self, status) -> None:
+        if QMediaPlayer is None:
+            return
+        if status in {
+            QMediaPlayer.MediaStatus.EndOfMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+            QMediaPlayer.MediaStatus.NoMedia,
+        }:
+            self._start_next_sound()
+
+    @Slot()
+    def _on_audio_error(self, *_args) -> None:
+        self._start_next_sound()
 
     @staticmethod
     def _is_game_foreground() -> bool:

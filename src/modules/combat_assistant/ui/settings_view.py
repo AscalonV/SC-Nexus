@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -189,6 +190,7 @@ class CombatAssistantSettingsView(QWidget):
 
         # ---- feature cards ----------------------------------------------
         self._build_agony_card(s)
+        self._build_game_start_card(s)
         self._build_torp_card(s)
         self._build_bomb_card(s)
         self._build_capture_card(s)
@@ -266,6 +268,49 @@ class CombatAssistantSettingsView(QWidget):
         self._module.settings.agony_extra_users = names
         self._module.settings.save()
         self._module.request_overlay_refresh()
+
+    # ------------------------------------------------------------------
+    # Game-start card
+    # ------------------------------------------------------------------
+
+    def _build_game_start_card(self, s) -> None:
+        box = QGroupBox("Game Start Alert")
+        lay = QVBoxLayout(box)
+
+        self._game_start_chk = QCheckBox("Enable")
+        self._game_start_chk.setChecked(s.game_start_enabled)
+        self._game_start_chk.toggled.connect(
+            lambda v: self._save_bool("game_start_enabled", v)
+        )
+        lay.addWidget(self._game_start_chk)
+
+        info = QLabel(
+            "Plays a sound when the game start is detected. Be carful with the volume"
+        )
+        info.setStyleSheet("color: #9bb3d6; font-size: 11px;")
+        lay.addWidget(info)
+
+        volume_row = QHBoxLayout()
+        volume_label = QLabel("Volume")
+        volume_label.setStyleSheet("color: #e8f0fe; font-size: 11px;")
+        self._game_start_volume = QSlider(Qt.Orientation.Horizontal)
+        self._game_start_volume.setRange(0, 100)
+        self._game_start_volume.setValue(s.game_start_volume)
+        self._game_start_volume.valueChanged.connect(self._save_game_start_volume)
+        self._game_start_volume_value = QLabel(f"{s.game_start_volume}%")
+        self._game_start_volume_value.setStyleSheet("color: #9bb3d6; font-size: 11px;")
+        self._game_start_volume_value.setFixedWidth(40)
+        volume_row.addWidget(volume_label)
+        volume_row.addWidget(self._game_start_volume, 1)
+        volume_row.addWidget(self._game_start_volume_value)
+        lay.addLayout(volume_row)
+
+        self._root_lay.addWidget(box)
+
+    def _save_game_start_volume(self, value: int) -> None:
+        self._module.settings.game_start_volume = value
+        self._module.settings.save()
+        self._game_start_volume_value.setText(f"{value}%")
 
     # ------------------------------------------------------------------
     # Torpedo card

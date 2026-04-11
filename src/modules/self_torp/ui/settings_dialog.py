@@ -55,6 +55,8 @@ QSpinBox {
 }
 """
 
+_MS_SPIN_MAX = 2_147_483_647
+
 
 class SelfTorpSettingsDialog(QDialog):
     """
@@ -135,14 +137,14 @@ class SelfTorpSettingsDialog(QDialog):
 
         # First key delay
         self._delay_spin = QSpinBox()
-        self._delay_spin.setRange(0, 200)
+        self._delay_spin.setRange(0, _MS_SPIN_MAX)
         self._delay_spin.setSuffix(" ms")
         self._delay_spin.setValue(first_key_delay_ms)
         form.addRow("First key delay:", self._delay_spin)
 
         # Burst gap
         self._gap_spin = QSpinBox()
-        self._gap_spin.setRange(0, 20)
+        self._gap_spin.setRange(0, _MS_SPIN_MAX)
         self._gap_spin.setSuffix(" ms")
         self._gap_spin.setValue(burst_gap_ms)
         self._gap_spin.setToolTip(

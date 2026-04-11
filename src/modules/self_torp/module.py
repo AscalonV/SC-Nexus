@@ -11,10 +11,9 @@ from __future__ import annotations
 import ctypes
 import subprocess
 import sys
-from pathlib import Path
 
 from pydantic import BaseModel, Field
-from PySide6.QtCore import QObject, QTimer, Slot
+from PySide6.QtCore import QObject, Slot
 from PySide6.QtWidgets import QMessageBox, QWidget
 
 from src.core.config import AppConfig, USER_DATA_DIR
@@ -91,7 +90,8 @@ class SelfTorpModule(ModuleBase):
                 self._try_start_engine()
             else:
                 self.status_changed.emit("Needs admin")
-                QTimer.singleShot(0, self._prompt_elevation)
+                if not _relaunch_as_admin():
+                    self._disable_module()
 
     def shutdown(self) -> None:
         self._stop_engine()
@@ -104,14 +104,15 @@ class SelfTorpModule(ModuleBase):
     def on_toggle(self, enabled: bool) -> None:
         if enabled:
             if not _is_admin():
-                self._prompt_elevation()
+                if self._confirm_restart_as_admin() and _relaunch_as_admin():
+                    return
+                self._disable_module()
                 return
             self._settings.enabled = True
             self._try_start_engine()
         else:
-            self._settings.enabled = False
-            self._stop_engine()
-            self.status_changed.emit("Inactive")
+            self._disable_module()
+            return
         self._settings.save()
 
     def open_settings_dialog(self, parent: QWidget) -> None:
@@ -181,7 +182,13 @@ class SelfTorpModule(ModuleBase):
     # Admin helpers
     # ------------------------------------------------------------------
 
-    def _prompt_elevation(self) -> None:
+    def _disable_module(self) -> None:
+        self._settings.enabled = False
+        self._stop_engine()
+        self.status_changed.emit("Inactive")
+        self._settings.save()
+
+    def _confirm_restart_as_admin(self) -> bool:
         box = QMessageBox()
         box.setWindowTitle("Self-Torp")
         box.setText(
@@ -192,8 +199,7 @@ class SelfTorpModule(ModuleBase):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         box.setDefaultButton(QMessageBox.StandardButton.Yes)
-        if box.exec() == QMessageBox.StandardButton.Yes:
-            _relaunch_as_admin()
+        return box.exec() == QMessageBox.StandardButton.Yes
 
 
 def _is_admin() -> bool:
@@ -203,8 +209,10 @@ def _is_admin() -> bool:
         return False
 
 
-def _relaunch_as_admin() -> None:
+def _relaunch_as_admin() -> bool:
     exe = sys.executable
-    args = " ".join(f'"{a}"' for a in sys.argv)
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
+    args = subprocess.list2cmdline(sys.argv)
+    result = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
+    if result <= 32:
+        return False
     sys.exit(0)

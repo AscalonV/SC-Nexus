@@ -279,6 +279,9 @@ class LaunchpadWindow(QMainWindow):
 
     def _on_toggle(self, module: ModuleBase, enabled: bool) -> None:
         module.on_toggle(enabled)
+        tile = self._tiles.get(module.module_id)
+        if tile is not None:
+            tile.set_toggle_state(module.is_enabled)
 
     def _on_settings(self, module: ModuleBase) -> None:
         """Route to popup dialog or stacked sub-view depending on the module."""
