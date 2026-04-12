@@ -205,6 +205,7 @@ class CombatAssistantModule(ModuleBase):
     display_name = "Combat Assistant"
     description  = "Real-time overlay: agony buff, torpedos, bomb tracker, capture alerts."
     module_type  = ModuleType.TOGGLEABLE
+    prefers_maximized = True
 
     @property
     def is_enabled(self) -> bool:

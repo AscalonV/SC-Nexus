@@ -137,6 +137,19 @@ class ModuleBase(QObject, metaclass=_QObjectABCMeta):
         """
         return None
 
+    def open_module_settings(self, parent: QWidget) -> bool:
+        """
+        Called when the header Settings button is clicked while this module is open.
+        Return True if the module handled it (suppresses global settings fallback).
+        Override in OPENABLE modules that want a module-specific settings menu/dialog.
+        """
+        return False
+
+    @property
+    def prefers_maximized(self) -> bool:
+        """Return True to have the main window maximized when this module opens."""
+        return False
+
     # ------------------------------------------------------------------
     # Config propagation
     # ------------------------------------------------------------------

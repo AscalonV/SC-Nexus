@@ -15,9 +15,10 @@ The header bar persists across all pages and provides:
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -87,14 +88,18 @@ class LaunchpadWindow(QMainWindow):
         self._tiles: dict[str, ModuleTile] = {}
         self._view_cache: dict[str, QWidget] = {}  # module_id → built widget
         self._nav_stack: list[str] = []  # names for the back-button label
+        self._current_module: ModuleBase | None = None
+        self._hub_geometry = None  # saved before entering a module
 
         self.setWindowTitle("SC Nexus")
         self.setMinimumSize(720, 500)
         self.setStyleSheet(_WINDOW_STYLE)
 
         self._build_ui()
-        self._register_modules()
-        self._populate_hub()
+        # Defer module initialization so the window appears immediately.
+        # QTimer.singleShot(0) fires after the first event-loop iteration,
+        # by which point show() has been processed and the window is visible.
+        QTimer.singleShot(0, self._deferred_init)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -137,11 +142,11 @@ class LaunchpadWindow(QMainWindow):
         layout.addWidget(self._back_btn)
 
         # App title
-        title = QLabel("SC Nexus")
-        title.setStyleSheet(
+        self._title_lbl = QLabel("SC Nexus")
+        self._title_lbl.setStyleSheet(
             f"color: {_ACCENT}; font-size: 18px; font-weight: bold; letter-spacing: 1px;"
         )
-        layout.addWidget(title)
+        layout.addWidget(self._title_lbl)
 
         layout.addStretch(1)
 
@@ -149,9 +154,7 @@ class LaunchpadWindow(QMainWindow):
         self._global_settings_btn = QPushButton("⚙ Settings")
         self._global_settings_btn.setStyleSheet(_SETTINGS_BTN_STYLE)
         self._global_settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._global_settings_btn.clicked.connect(
-            lambda: self._app.open_global_settings(self)
-        )
+        self._global_settings_btn.clicked.connect(self._on_settings_btn)
         layout.addWidget(self._global_settings_btn)
 
         return header
@@ -185,13 +188,19 @@ class LaunchpadWindow(QMainWindow):
     # Module registration
     # ------------------------------------------------------------------
 
+    def _deferred_init(self) -> None:
+        """Called once after the first event-loop iteration (window already visible)."""
+        self._register_modules()
+        self._populate_hub()
+
     def _register_modules(self) -> None:
         """Instantiate all modules, initialise them, and register with app."""
         from src.modules.combat_analysis.module import CombatAnalyzerModule
         from src.modules.combat_assistant.module import CombatAssistantModule
+        from src.modules.loadout_manager.module import LoadoutManagerModule
         from src.modules.self_torp.module import SelfTorpModule
 
-        for module_cls in (CombatAnalyzerModule, CombatAssistantModule, SelfTorpModule):
+        for module_cls in (CombatAnalyzerModule, CombatAssistantModule, LoadoutManagerModule, SelfTorpModule):
             module = module_cls()
             self._app.register_module(module)
 
@@ -233,7 +242,26 @@ class LaunchpadWindow(QMainWindow):
             self._stack.addWidget(view)
             self._view_cache[mid] = view
 
+        # Save hub geometry before resizing
+        self._hub_geometry = self.geometry()
+        self._current_module = module
+        self._title_lbl.setText(module.display_name)
+
         self._stack.setCurrentWidget(self._view_cache[mid])
+        if getattr(module, 'prefers_maximized', False):
+            if not self.isMaximized():
+                self.showMaximized()
+        else:
+            if self.isMaximized():
+                self.showNormal()
+            self.adjustSize()
+            if module.module_id == "loadout_manager":
+                screen = QApplication.primaryScreen().availableGeometry()
+                fg = self.frameGeometry()
+                self.move(
+                    screen.center().x() - fg.width() // 2,
+                    screen.center().y() - fg.height() // 2,
+                )
         self._nav_stack.append(module.display_name)
         self._update_back_button()
 
@@ -247,11 +275,39 @@ class LaunchpadWindow(QMainWindow):
             self._stack.addWidget(panel)
             self._view_cache[key] = panel
 
+        self._hub_geometry = self.geometry()
+        self._current_module = module
         self._stack.setCurrentWidget(self._view_cache[key])
+        if getattr(module, 'prefers_maximized', False):
+            if not self.isMaximized():
+                self.showMaximized()
+        else:
+            if self.isMaximized():
+                self.showNormal()
         self._nav_stack.append(f"{module.display_name} Settings")
         self._update_back_button()
 
     def show_hub(self) -> None:
+        if self._current_module is not None:
+            if getattr(self._current_module, 'prefers_maximized', False):
+                # Coming back from a maximized module — restore and center.
+                self.showNormal()
+                self.adjustSize()
+                if self._hub_geometry is not None:
+                    self.setGeometry(self._hub_geometry)
+                else:
+                    screen = QApplication.primaryScreen().availableGeometry()
+                    fg = self.frameGeometry()
+                    self.move(
+                        screen.center().x() - fg.width() // 2,
+                        screen.center().y() - fg.height() // 2,
+                    )
+            elif self._hub_geometry is not None:
+                self.showNormal()
+                self.setGeometry(self._hub_geometry)
+        self._current_module = None
+        self._title_lbl.setText("SC Nexus")
+        self.setWindowTitle("SC Nexus")
         self._stack.setCurrentWidget(self._hub_page)
         self._nav_stack.clear()
         self._update_back_button()
@@ -276,6 +332,13 @@ class LaunchpadWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Module event handlers
     # ------------------------------------------------------------------
+
+    def _on_settings_btn(self) -> None:
+        """Route Settings button to module settings or global settings."""
+        if self._current_module is not None:
+            if self._current_module.open_module_settings(self):
+                return
+        self._app.open_global_settings(self)
 
     def _on_toggle(self, module: ModuleBase, enabled: bool) -> None:
         module.on_toggle(enabled)

@@ -81,7 +81,8 @@ class SelfTorpSettingsDialog(QDialog):
         self.setStyleSheet(_STYLE)
         self.setMinimumWidth(380)
         self.setWindowFlags(
-            self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
+            (self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+            | Qt.WindowType.WindowCloseButtonHint
         )
 
         self.result_hotkey    = hotkey

@@ -383,6 +383,8 @@ class HotkeyEngine(QThread):
                 try:
                     self._execute_burst()
                     self.hotkey_fired.emit()
+                except Exception:
+                    pass  # Never let a burst error kill the worker thread
                 finally:
                     self._fire_lock.release()
 
