@@ -82,9 +82,11 @@ _WINDOW_STYLE = f"background-color: {_BG_APP};"
 class LaunchpadWindow(QMainWindow):
     """Main application window with a persistent header and stacked navigation."""
 
-    def __init__(self, app: "SCNexusApp") -> None:  # type: ignore[name-defined]
+    def __init__(self, app: "SCNexusApp", ready_event=None, splash_proc=None) -> None:  # type: ignore[name-defined]
         super().__init__()
         self._app = app
+        self._ready_event = ready_event
+        self._splash_proc = splash_proc
         self._tiles: dict[str, ModuleTile] = {}
         self._view_cache: dict[str, QWidget] = {}  # module_id → built widget
         self._nav_stack: list[str] = []  # names for the back-button label
@@ -189,20 +191,55 @@ class LaunchpadWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _deferred_init(self) -> None:
-        """Called once after the first event-loop iteration (window already visible)."""
-        self._register_modules()
-        self._populate_hub()
-
-    def _register_modules(self) -> None:
-        """Instantiate all modules, initialise them, and register with app."""
+        """Kick off one-module-per-tick async registration chain."""
         from src.modules.combat_analysis.module import CombatAnalyzerModule
         from src.modules.combat_assistant.module import CombatAssistantModule
         from src.modules.loadout_manager.module import LoadoutManagerModule
         from src.modules.self_torp.module import SelfTorpModule
 
-        for module_cls in (CombatAnalyzerModule, CombatAssistantModule, LoadoutManagerModule, SelfTorpModule):
+        self._pending_modules: list = [
+            CombatAnalyzerModule,
+            CombatAssistantModule,
+            LoadoutManagerModule,
+            SelfTorpModule,
+        ]
+        QTimer.singleShot(0, self._register_next_module)
+
+    def _register_next_module(self) -> None:
+        """Register one module then schedule the next tick, keeping the event loop free."""
+        if self._pending_modules:
+            module_cls = self._pending_modules.pop(0)
             module = module_cls()
             self._app.register_module(module)
+            QTimer.singleShot(0, self._register_next_module)
+            return
+        # All modules registered — build the hub.
+        self._populate_hub()
+        if self._ready_event is not None:
+            # Signal the splash subprocess to transition to READY, then wait
+            # for it to exit before showing the main window.
+            self._ready_event.set()
+            self._poll_splash_done()
+        else:
+            self._show_centered()
+
+    def _poll_splash_done(self) -> None:
+        """Check every 50 ms until the splash subprocess has exited, then show."""
+        if self._splash_proc is not None and self._splash_proc.is_alive():
+            QTimer.singleShot(50, self._poll_splash_done)
+        else:
+            self._show_centered()
+
+    def _show_centered(self) -> None:
+        """Show the main window centered on the primary screen."""
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.adjustSize()
+        fg = self.frameGeometry()
+        self.move(
+            screen.center().x() - fg.width() // 2,
+            screen.center().y() - fg.height() // 2,
+        )
+        self.show()
 
     def _populate_hub(self) -> None:
         """Create a ModuleTile for each registered module and insert into the hub."""

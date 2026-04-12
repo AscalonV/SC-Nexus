@@ -58,14 +58,72 @@ def _set_dpi_awareness() -> None:
             pass
 
 
+def _check_admin_relaunch() -> None:
+    """If self-torp is persisted-enabled and we are not admin, trigger UAC before Qt loads.
+
+    This prevents the program from fully initialising twice (once without admin,
+    once again after the elevated relaunch).  If the user denies/cancels the prompt
+    we write enabled=False so that SelfTorpModule.initialize() will not ask again.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes as _ct
+        if _ct.windll.shell32.IsUserAnAdmin():
+            return  # already elevated – nothing to do
+    except Exception:
+        return
+
+    import json as _json
+    settings_path = Path(__file__).parent / "user_data" / "self_torp_settings.json"
+    try:
+        if not settings_path.exists():
+            return
+        data = _json.loads(settings_path.read_text(encoding="utf-8"))
+        if not data.get("enabled", False):
+            return
+    except Exception:
+        return
+
+    # Self-torp is enabled but not elevated — ask for UAC right now.
+    import subprocess as _sp
+    args = _sp.list2cmdline(sys.argv)
+    result = _ct.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args, None, 1)
+    if result > 32:
+        sys.exit(0)  # elevated copy is launching; exit the non-elevated one
+
+    # UAC was denied / cancelled — turn self-torp off so initialize() won't ask again.
+    try:
+        data["enabled"] = False
+        settings_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _check_admin_relaunch()
     _set_dpi_awareness()
 
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QFont
 
     from src.core.app import SCNexusApp
+    from src.launchpad.splash import run_splash_process
     from src.launchpad.window import LaunchpadWindow
+
+    # Start the animated splash in its own OS process so its 25 fps timer
+    # can never be starved by anything the main process does during loading.
+    ready_event = multiprocessing.Event()
+    splash_proc: multiprocessing.Process | None = None
+    try:
+        splash_proc = multiprocessing.Process(
+            target=run_splash_process,
+            args=(ready_event,),
+            daemon=True,
+        )
+        splash_proc.start()
+    except Exception:
+        splash_proc = None
 
     app = SCNexusApp(sys.argv)
     app.setApplicationName("SC Nexus")
@@ -76,8 +134,8 @@ def main() -> None:
     font = QFont("Segoe UI", 10)
     app.setFont(font)
 
-    window = LaunchpadWindow(app)
-    window.show()
+    window = LaunchpadWindow(app, ready_event=ready_event, splash_proc=splash_proc)
+    # window.show() is called by _show_centered() once the splash process exits
 
     sys.exit(app.exec())
 

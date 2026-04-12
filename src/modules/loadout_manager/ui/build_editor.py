@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 if TYPE_CHECKING:
     from src.modules.loadout_manager.database import Build, LoadoutDatabase
 
-# Assets: src/modules/loadout_manager/assets/{N}-{A|B|C}.png
-_ASSETS_DIR = Path(__file__).parent.parent / "assets"
+# Assets: src/modules/loadout_manager/assets/Implants/{N}-{A|B|C}.png
+_ASSETS_DIR = Path(__file__).parent.parent / "assets" / "Implants"
 _VARIANTS = ("A", "B", "C")   # row 0=A (value 1), row 1=B (value 2), row 2=C (value 3)
 _ICON_SIZE = 40                # px — rendered size of each crew icon cell
 
